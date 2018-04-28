@@ -1,4 +1,4 @@
-{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE LambdaCase, TemplateHaskell #-}
 {-# OPTIONS_GHC -fno-warn-type-defaults #-}
 {-|
 Module      : PostgREST.Config
@@ -19,6 +19,7 @@ module PostgREST.Config ( prettyVersion
                         , readOptions
                         , corsPolicy
                         , minimumPgVersion
+                        , pgVersion95
                         , pgVersion96
                         , AppConfig (..)
                         )
@@ -42,15 +43,16 @@ import           Data.Scientific              (floatingOrInteger)
 import           Data.String                  (String)
 import           Data.Text                    (dropAround,
                                                intercalate, lines,
-                                               strip)
+                                               strip, take)
 import           Data.Text.Encoding           (encodeUtf8)
 import           Data.Text.IO                 (hPutStrLn)
 import           Data.Version                 (versionBranch)
+import           Development.GitRev           (gitHash)
 import           Network.Wai
 import           Network.Wai.Middleware.Cors  (CorsResourcePolicy (..))
 import           Options.Applicative          hiding (str)
 import           Paths_postgrest              (version)
-import           Protolude                    hiding (hPutStrLn,
+import           Protolude                    hiding (hPutStrLn, take,
                                                intercalate, (<>))
 import           System.IO                    (hPrint)
 import           System.IO.Error              (IOError)
@@ -75,6 +77,7 @@ data AppConfig = AppConfig {
   , configMaxRows           :: Maybe Integer
   , configReqCheck          :: Maybe Text
   , configQuiet             :: Bool
+  , configSettings          :: [(Text, Text)]
   }
 
 defaultCorsPolicy :: CorsResourcePolicy
@@ -102,7 +105,9 @@ corsPolicy req = case lookup "origin" headers of
 
 -- | User friendly version number
 prettyVersion :: Text
-prettyVersion = intercalate "." $ map show $ versionBranch version
+prettyVersion =
+  intercalate "." (map show $ versionBranch version)
+  <> " (" <> take 7 $(gitHash) <> ")"
 
 -- | Version number used in docs
 docsVersion :: Text
@@ -133,6 +138,7 @@ readOptions = do
           <*> (join . fmap coerceInt <$> C.key "max-rows")
           <*> (mfilter (/= "") <$> C.key "pre-request")
           <*> pure False
+          <*> (fmap parsedPairToTextPair <$> C.subassocs "app.settings")
 
   case mAppConf of
     Nothing -> do
@@ -142,12 +148,20 @@ readOptions = do
       return appConf
 
   where
+    parsedPairToTextPair :: (Name, Value) -> (Text, Text)
+    parsedPairToTextPair (k, v) = (k, newValue)
+      where
+        newValue = case v of
+          String textVal -> textVal
+          _ -> show v
+
     parseJwtAudience :: Name -> C.ConfigParserM (Maybe StringOrURI)
     parseJwtAudience k =
       C.key k >>= \case
         Nothing -> pure Nothing -- no audience in config file
         Just aud -> case preview stringOrUri (aud :: String) of
           Nothing -> fail "Invalid Jwt audience. Check your configuration."
+          (Just "") -> pure Nothing
           aud' -> pure aud'
 
     coerceInt :: (Read i, Integral i) => Value -> Maybe i
@@ -155,9 +169,9 @@ readOptions = do
     coerceInt (String x) = readMaybe $ toS x
     coerceInt _          = Nothing
 
-    coerceBool ::  Value -> Maybe Bool
+    coerceBool :: Value -> Maybe Bool
     coerceBool (Bool b)   = Just b
-    coerceBool (String x) = readMaybe $ toS x
+    coerceBool (String b) = readMaybe $ toS b
     coerceBool _          = Nothing
 
     opts = info (helper <*> pathParser) $
@@ -214,7 +228,10 @@ pathParser =
 
 -- | Tells the minimum PostgreSQL version required by this version of PostgREST
 minimumPgVersion :: PgVersion
-minimumPgVersion = PgVersion 90300 "9.3"
+minimumPgVersion = PgVersion 90400 "9.4"
 
 pgVersion96 :: PgVersion
 pgVersion96 = PgVersion 90600 "9.6"
+
+pgVersion95 :: PgVersion
+pgVersion95 = PgVersion 90500 "9.5"

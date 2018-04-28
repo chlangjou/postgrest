@@ -112,9 +112,11 @@ spec =
     context "foreign entities embedding" $ do
       it "can embed if related tables are in the exposed schema" $ do
         post "/rpc/getproject?select=id,name,client{id},tasks{id}" [json| { "id": 1} |] `shouldRespondWith`
-          [str|[{"id":1,"name":"Windows 7","client":{"id":1},"tasks":[{"id":1},{"id":2}]}]|]
+          [json|[{"id":1,"name":"Windows 7","client":{"id":1},"tasks":[{"id":1},{"id":2}]}]|]
+          { matchHeaders = [matchContentTypeJson] }
         get "/rpc/getproject?id=1&select=id,name,client{id},tasks{id}" `shouldRespondWith`
-          [str|[{"id":1,"name":"Windows 7","client":{"id":1},"tasks":[{"id":1},{"id":2}]}]|]
+          [json|[{"id":1,"name":"Windows 7","client":{"id":1},"tasks":[{"id":1},{"id":2}]}]|]
+          { matchHeaders = [matchContentTypeJson] }
 
       it "cannot embed if the related table is not in the exposed schema" $ do
         post "/rpc/single_article?select=*,article_stars{*}" [json|{ "id": 1}|]
@@ -273,8 +275,14 @@ spec =
           [json|[{"my_json":{"a": 1, "b": "two"},"num":3,"str":"four"}]|] { matchHeaders = [matchContentTypeJson] }
 
       it "returns a row result when there are many INOUT params" $
-        get "/rpc/many_inout_params?num=1&str=two" `shouldRespondWith`
-          [json| [{"num":1,"str":"two","b":true}]|] { matchHeaders = [matchContentTypeJson] }
+        get "/rpc/many_inout_params?num=1&str=two&b=false" `shouldRespondWith`
+          [json| [{"num":1,"str":"two","b":false}]|] { matchHeaders = [matchContentTypeJson] }
+
+    it "can handle procs with args that have a DEFAULT value" $ do
+      get "/rpc/many_inout_params?num=1&str=two" `shouldRespondWith`
+        [json| [{"num":1,"str":"two","b":true}]|] { matchHeaders = [matchContentTypeJson] }
+      get "/rpc/three_defaults?b=4" `shouldRespondWith`
+        [json|8|] { matchHeaders = [matchContentTypeJson] }
 
     it "can map a RAISE error code and message to a http status" $
       get "/rpc/raise_pt402"
@@ -286,23 +294,42 @@ spec =
     it "defaults to status 500 if RAISE code is PT not followed by a number" $
       get "/rpc/raise_bad_pt" `shouldRespondWith` 500
 
-    context "only for POST rpc" $ do
-      context "expects a single json object" $ do
-        it "does not expand posted json into parameters" $
-          request methodPost "/rpc/singlejsonparam"
-            [("Prefer","params=single-object")] [json| { "p1": 1, "p2": "text", "p3" : {"obj":"text"} } |] `shouldRespondWith`
-            [json| { "p1": 1, "p2": "text", "p3" : {"obj":"text"} } |]
-            { matchHeaders = [matchContentTypeJson] }
+    context "expects a single json object" $ do
+      it "does not expand posted json into parameters" $
+        request methodPost "/rpc/singlejsonparam"
+          [("prefer","params=single-object")] [json| { "p1": 1, "p2": "text", "p3" : {"obj":"text"} } |] `shouldRespondWith`
+          [json| { "p1": 1, "p2": "text", "p3" : {"obj":"text"} } |]
+          { matchHeaders = [matchContentTypeJson] }
 
-        it "accepts parameters from an html form" $
-          request methodPost "/rpc/singlejsonparam"
-            [("Prefer","params=single-object"),("Content-Type", "application/x-www-form-urlencoded")]
-            ("integer=7&double=2.71828&varchar=forms+are+fun&" <>
-             "boolean=false&date=1900-01-01&money=$3.99&enum=foo") `shouldRespondWith`
-            [json| { "integer": "7", "double": "2.71828", "varchar" : "forms are fun"
-                   , "boolean":"false", "date":"1900-01-01", "money":"$3.99", "enum":"foo" } |]
-                   { matchHeaders = [matchContentTypeJson] }
+      it "accepts parameters from an html form" $
+        request methodPost "/rpc/singlejsonparam"
+          [("Prefer","params=single-object"),("Content-Type", "application/x-www-form-urlencoded")]
+          ("integer=7&double=2.71828&varchar=forms+are+fun&" <>
+           "boolean=false&date=1900-01-01&money=$3.99&enum=foo") `shouldRespondWith`
+          [json| { "integer": "7", "double": "2.71828", "varchar" : "forms are fun"
+                 , "boolean":"false", "date":"1900-01-01", "money":"$3.99", "enum":"foo" } |]
+                 { matchHeaders = [matchContentTypeJson] }
 
+      it "works with GET" $
+        request methodGet "/rpc/singlejsonparam?p1=1&p2=text" [("Prefer","params=single-object")] ""
+          `shouldRespondWith` [json|{ "p1": "1", "p2": "text"}|]
+          { matchHeaders = [matchContentTypeJson] }
+
+    it "should work with an overloaded function" $ do
+      get "/rpc/overloaded" `shouldRespondWith`
+        [json|[{ "overloaded": 1 },
+               { "overloaded": 2 },
+               { "overloaded": 3 }]|]
+        { matchHeaders = [matchContentTypeJson] }
+      request methodPost "/rpc/overloaded" [("Prefer","params=single-object")]
+        [json|[{"x": 1, "y": "first"}, {"x": 2, "y": "second"}]|]
+       `shouldRespondWith`
+        [json|[{"x": 1, "y": "first"}, {"x": 2, "y": "second"}]|]
+        { matchHeaders = [matchContentTypeJson] }
+      get "/rpc/overloaded?a=1&b=2" `shouldRespondWith` [str|3|]
+      get "/rpc/overloaded?a=1&b=2&c=3" `shouldRespondWith` [str|"123"|]
+
+    context "only for POST rpc" $
       it "gives a parse filter error if GET style proc args are specified" $
         post "/rpc/sayhello?name=John" [json|{}|] `shouldRespondWith` 400
 

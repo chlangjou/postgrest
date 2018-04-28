@@ -112,16 +112,19 @@ CREATE TABLE items (
 );
 
 
-SET search_path = public, pg_catalog;
-
---
--- Name: always_true(test.items); Type: FUNCTION; Schema: public; Owner: -
---
-
 CREATE FUNCTION always_true(test.items) RETURNS boolean
     LANGUAGE sql STABLE
     AS $$ SELECT true $$;
 
+CREATE FUNCTION anti_id(test.items) RETURNS bigint
+    LANGUAGE sql STABLE
+    AS $_$ SELECT $1.id * -1 $_$;
+
+SET search_path = public, pg_catalog;
+
+CREATE FUNCTION always_false(test.items) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$ SELECT false $$;
 
 create table public_consumers (
     id                  serial             not null unique,
@@ -135,16 +138,6 @@ create table public_orders (
     number              integer            not null,
     primary key (id)
 );
-
---
--- Name: anti_id(test.items); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION anti_id(test.items) RETURNS bigint
-    LANGUAGE sql STABLE
-    AS $_$ SELECT $1.id * -1 $_$;
-
-
 
 SET search_path = تست, pg_catalog;
 
@@ -638,6 +631,9 @@ CREATE TABLE no_pk (
     b character varying
 );
 
+CREATE TABLE only_pk (
+    id integer primary key
+);
 
 --
 -- Name: nullable_integer; Type: TABLE; Schema: test; Owner: -
@@ -1332,6 +1328,110 @@ $$ language sql;
 create or replace function test.set_cookie_twice() returns void as $$
   set local "response.headers" = '[{"Set-Cookie": "sessionid=38afes7a8; HttpOnly; Path=/"}, {"Set-Cookie": "id=a3fWa; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Secure; HttpOnly"}]';
 $$ language sql;
---
--- PostgreSQL database dump complete
---
+
+create or replace function test.three_defaults(a int default 1, b int default 2, c int default 3) returns int as $$
+select a + b + c
+$$ language sql;
+
+create or replace function test.overloaded() returns setof int as $$
+  values (1), (2), (3);
+$$ language sql;
+
+create or replace function test.overloaded(pg_catalog.json) returns table(x int, y text) as $$
+  select * from json_to_recordset($1) as r(x int, y text);
+$$ language sql;
+
+create or replace function test.overloaded(a int, b int) returns int as $$
+  select a + b
+$$ language sql;
+
+create or replace function test.overloaded(a text, b text, c text) returns text as $$
+  select a || b || c
+$$ language sql;
+
+create table test.leak(
+  id serial primary key,
+  blob bytea
+);
+
+create function test.leak(blob bytea) returns void as $$ begin end; $$ language plpgsql;
+
+create table test.perf_articles(
+  id integer not null,
+  body text not null
+);
+
+create table test.employees(
+  first_name text,
+  last_name text,
+  salary money,
+  company text,
+  occupation text,
+  primary key(first_name, last_name)
+);
+
+create table test.tiobe_pls(
+  name text primary key,
+  rank smallint
+);
+
+create table test.family_tree (
+  id text not null primary key,
+  name text not null,
+  parent text
+);
+alter table only test.family_tree add constraint pptr foreign key (parent) references test.family_tree(id);
+
+create table test.organizations (
+  id integer primary key,
+  name text,
+  referee integer,
+  auditor integer
+);
+alter table only test.organizations add constraint pptr1 foreign key (referee) references test.organizations(id);
+alter table only test.organizations add constraint pptr2 foreign key (auditor) references test.organizations(id);
+
+create table private.authors(
+  id integer primary key,
+  name text
+);
+
+create table private.books(
+  id integer primary key,
+  title text,
+  publication_year smallint,
+  author_id integer references private.authors(id)
+);
+
+create view test.authors as select id, name from private.authors;
+
+create view test.books as select id, title, publication_year, author_id from private.books;
+create view test.forties_books as select id, title, publication_year, author_id from private.books where publication_year >= 1940 and publication_year < 1950;
+create view test.fifties_books as select id, title, publication_year, author_id from private.books where publication_year >= 1950 and publication_year < 1960;
+create view test.sixties_books as select id, title, publication_year, author_id from private.books where publication_year >= 1960 and publication_year < 1970;
+
+create table person (
+  id integer primary key,
+  name character varying not null);
+
+create table message (
+  id integer primary key,
+  body text not null default '',
+  sender bigint not null references person(id),
+  recipient bigint not null references person(id));
+
+create view person_detail as
+  select p.id, p.name, s.count as sent, r.count as received
+  from person p
+  join lateral (select message.sender, count(message.id) as count from message group by message.sender) s on s.sender = p.id
+  join lateral (select message.recipient, count(message.id) as count from message group by message.recipient) r on r.recipient = p.id;
+
+create table space(
+  id integer primary key,
+  name text);
+
+create table zone(
+  id integer primary key,
+  name text,
+  zone_type_id integer,
+  space_id integer references space(id));

@@ -61,6 +61,23 @@ GRANT ALL ON TABLE
     , descendant
     , being_part
     , part
+    , leak
+    , perf_articles
+    , employees
+    , tiobe_pls
+    , only_pk
+    , family_tree
+    , organizations
+    , authors
+    , books
+    , forties_books
+    , fifties_books
+    , sixties_books
+    , person
+    , message
+    , person_detail
+    , space
+    , zone
 TO postgrest_test_anonymous;
 
 GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
@@ -69,6 +86,7 @@ GRANT USAGE ON SEQUENCE
       auto_incrementing_pk_id_seq
     , items_id_seq
     , callcounter_count
+    , leak_id_seq
 TO postgrest_test_anonymous;
 
 -- Privileges for non anonymous users
@@ -81,3 +99,5 @@ GRANT UPDATE (article_id, user_id) ON TABLE limited_article_stars TO postgrest_t
 
 REVOKE EXECUTE ON FUNCTION privileged_hello(text) FROM PUBLIC; -- All functions are available to every role(PUBLIC) by default
 GRANT EXECUTE ON FUNCTION privileged_hello(text) TO postgrest_test_author;
+
+GRANT USAGE ON SCHEMA test TO postgrest_test_default_role;

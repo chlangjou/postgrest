@@ -7,10 +7,34 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- The configuration (e.g. `postgrest.conf`) now accepts arbitrary settings that will be passed through as session-local database settings. This can be used to pass in secret keys directly as strings, or via OS environment variables. For instance: `app.settings.jwt_secret = "$(MYAPP_JWT_SECRET)"` will take `MYAPP_JWT_SECRET` from the environment and make it available to postgresql functions as `current_setting('app.settings.jwt_secret')`. Only `app.settings.*` values in the configuration file are treated in this way. - @canadaduane
+- #256, Add support for bulk UPSERT with POST and single UPSERT with PUT - @steve-chavez
+- #1078, Add ability to specify source column in embed - @steve-chavez
+- #821, Allow embeds alias to be used in filters - @steve-chavez
+
+### Fixed
+
+- #828, Fix computed column only working in public schema - @steve-chavez
+- #925, Fix RPC high memory usage by using parametrized query and avoiding json encoding - @steve-chavez
+- #987, Fix embedding with self-reference foreign key - @steve-chavez
+- #1044, Fix view parent embedding when having many views - @steve-chavez
+
+### Changed
+
+- Computed columns now only work if they belong to the db-schema - @steve-chavez
+- To use RPC now the `json_to_record/json_to_recordset` functions are needed, these are available starting from PostgreSQL 9.4 - @steve-chavez
+- Overloaded functions now depend on the `dbStructure`, restart/sighup may be needed for their correct functioning - @steve-chavez
+
+## [0.4.4.0] - 2018-01-08
+
+### Added
+
 - #887, #601, #1007, Allow specifying dictionary and plain/phrase tsquery in full text search - @steve-chavez
 - #328, Allow doing GET on rpc - @steve-chavez
 - #917, Add ability to map RAISE errorcode/message to http status - @steve-chavez
 - #940, Add ability to map GUC to http response headers - @steve-chavez
+- #1022, Include git sha in version report - @begriffs
+- Faster queries using json_agg - @ruslantalpa
 
 ### Fixed
 
@@ -24,6 +48,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - #974, Fix RPC error when function has single OUT param - @steve-chavez
 - #1021, Reduce join size in allColumns for faster program start - @nextstopsun
 - #411, Remove the need for pk in &select for parent embed - @steve-chavez
+- #1016, Fix anonymous requests when configured with jwt-aud - @ruslantalpa
 
 ## [0.4.3.0] - 2017-09-06
 

@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-|
 Module      : PostgREST.ApiRequest
 Description : PostgREST functions to translate HTTP request to a domain type called ApiRequest.
@@ -13,7 +14,7 @@ module PostgREST.ApiRequest ( ApiRequest(..)
 
 import           Protolude
 import qualified Data.Aeson                as JSON
-import           Data.Aeson.Types          (emptyObject)
+import           Data.Aeson.Types          (emptyObject, emptyArray)
 import qualified Data.ByteString           as BS
 import qualified Data.ByteString.Internal  as BS (c2w)
 import qualified Data.ByteString.Lazy      as BL
@@ -33,14 +34,7 @@ import           Network.Wai               (Request (..))
 import           Network.Wai.Parse         (parseHttpAccept)
 import           PostgREST.RangeQuery      (NonnegRange, rangeRequested, restrictRange, rangeGeq, allRange, rangeLimit, rangeOffset)
 import           Data.Ranged.Boundaries
-import           PostgREST.Types           ( QualifiedIdentifier (..)
-                                           , Schema
-                                           , PayloadJSON(..)
-                                           , ContentType(..)
-                                           , ApiRequestError(..)
-                                           , toMime
-                                           , operators
-                                           , ftsOperators)
+import           PostgREST.Types
 import           Data.Ranged.Ranges        (Range(..), rangeIntersection, emptyRange)
 import qualified Data.CaseInsensitive      as CI
 import           Web.Cookie                (parseCookiesText)
@@ -48,10 +42,10 @@ import           Web.Cookie                (parseCookiesText)
 type RequestBody = BL.ByteString
 
 -- | Types of things a user wants to do to tables/views/procs
-data Action = ActionCreate | ActionRead
-            | ActionUpdate | ActionDelete
-            | ActionInfo   | ActionInvoke{isReadOnly :: Bool}
-            | ActionInspect
+data Action = ActionCreate  | ActionRead
+            | ActionUpdate  | ActionDelete
+            | ActionInfo    | ActionInvoke{isReadOnly :: Bool}
+            | ActionInspect | ActionSingleUpsert
             deriving Eq
 -- | The target db object of a user action
 data Target = TargetIdent QualifiedIdentifier
@@ -61,7 +55,7 @@ data Target = TargetIdent QualifiedIdentifier
             deriving Eq
 -- | How to return the inserted data
 data PreferRepresentation = Full | HeadersOnly | None deriving Eq
-                          --
+
 {-|
   Describes what the user wants to do. This data type is a
   translation of the raw elements of an HTTP request into domain
@@ -86,6 +80,8 @@ data ApiRequest = ApiRequest {
   , iPreferSingleObjectParameter :: Bool
   -- | Whether the client wants a result count (slower)
   , iPreferCount :: Bool
+  -- | Whether the client wants to UPSERT or ignore records on PK conflict
+  , iPreferResolution :: Maybe PreferResolution
   -- | Filters on the result ("id", "eq.10")
   , iFilters :: [(Text, Text)]
   -- | &and and &or parameters used for complex boolean logic
@@ -102,8 +98,6 @@ data ApiRequest = ApiRequest {
   , iHeaders :: [(Text, Text)]
   -- | Request Cookies
   , iCookies :: [(Text, Text)]
-  -- | Rpc query params e.g. /rpc/name?param1=val1, similar to filter but with no operator(eq, lt..)
-  , iRpcQParams :: [(Text, Text)]
   }
 
 -- | Examines HTTP request and translates it into user intent.
@@ -122,8 +116,10 @@ userApiRequest schema req reqBody
       , iPreferRepresentation = representation
       , iPreferSingleObjectParameter = singleObject
       , iPreferCount = hasPrefer "count=exact"
+      , iPreferResolution = if hasPrefer (show MergeDuplicates) then Just MergeDuplicates
+                            else if hasPrefer (show IgnoreDuplicates) then Just IgnoreDuplicates
+                            else Nothing
       , iFilters = filters
-      , iRpcQParams = rpcQParams
       , iLogic = [(toS k, toS $ fromJust v) | (k,v) <- qParams, isJust v, endingIn ["and", "or"] k ]
       , iSelect = toS $ fromMaybe "*" $ fromMaybe (Just "*") $ lookup "select" qParams
       , iOrder = [(toS k, toS $ fromJust v) | (k,v) <- qParams, isJust v, endingIn ["order"] k ]
@@ -137,6 +133,7 @@ userApiRequest schema req reqBody
       , iCookies = fromMaybe [] $ parseCookiesText <$> lookupHeader "Cookie"
       }
  where
+  -- rpcQParams = Rpc query params e.g. /rpc/name?param1=val1, similar to filter but with no operator(eq, lt..)
   (filters, rpcQParams) =
     case action of
       ActionInvoke{isReadOnly=True} -> partition (liftM2 (||) (isEmbedPath . fst) (hasOperator . snd)) flts
@@ -148,20 +145,22 @@ userApiRequest schema req reqBody
   isEmbedPath = T.isInfixOf "."
   isTargetingProc = fromMaybe False $ (== "rpc") <$> listToMaybe path
   payload =
-    case decodeContentType . fromMaybe "application/json" $ lookupHeader "content-type" of
-      CTApplicationJSON ->
-        note "All object keys must match" . ensureUniform . pluralize
+    case (decodeContentType . fromMaybe "application/json" $ lookupHeader "content-type", action) of
+      (_, ActionInvoke{isReadOnly=True}) ->
+        Right $ PayloadJSON (JSON.encode $ M.fromList $ second JSON.toJSON <$> rpcQParams) PJObject (S.fromList $ fst <$> rpcQParams)
+      (CTApplicationJSON, _) ->
+        note "All object keys must match" . payloadAttributes reqBody
           =<< if BL.null reqBody && isTargetingProc
                then Right emptyObject
                else JSON.eitherDecode reqBody
-      CTTextCSV ->
-        note "All lines must have same number of fields" . ensureUniform . csvToJson
-          =<< CSV.decodeByName reqBody
-      CTOther "application/x-www-form-urlencoded" ->
-        Right . PayloadJSON . V.singleton . M.fromList
-                    . map (toS *** JSON.String . toS) . parseSimpleQuery
-                    $ toS reqBody
-      ct ->
+      (CTTextCSV, _) -> do
+        json <- csvToJson <$> CSV.decodeByName reqBody
+        note "All lines must have same number of fields" $ payloadAttributes (JSON.encode json) json
+      (CTOther "application/x-www-form-urlencoded", _) ->
+        let json = M.fromList . map (toS *** JSON.String . toS) . parseSimpleQuery $ toS reqBody
+            keys = S.fromList $ M.keys json in
+        Right $ PayloadJSON (JSON.encode json) PJObject keys
+      (ct, _) ->
         Left $ toS $ "Content-Type not acceptable: " <> toMime ct
   topLevelRange = fromMaybe allRange $ M.lookup "limit" ranges
   action =
@@ -174,6 +173,7 @@ userApiRequest schema req reqBody
                     then ActionInvoke{isReadOnly=False}
                     else ActionCreate
       "PATCH"   -> ActionUpdate
+      "PUT"     -> ActionSingleUpsert
       "DELETE"  -> ActionDelete
       "OPTIONS" -> ActionInfo
       _         -> ActionInspect
@@ -184,9 +184,8 @@ userApiRequest schema req reqBody
               ["rpc", proc] -> TargetProc
                               $ QualifiedIdentifier schema proc
               other         -> TargetUnknown other
-  shouldParsePayload = action `elem` [ActionCreate, ActionUpdate, ActionInvoke{isReadOnly=False}]
-  relevantPayload | action == ActionInvoke{isReadOnly=True} = Nothing
-                  | shouldParsePayload = rightToMaybe payload
+  shouldParsePayload = action `elem` [ActionCreate, ActionUpdate, ActionSingleUpsert, ActionInvoke{isReadOnly=False}, ActionInvoke{isReadOnly=True}]
+  relevantPayload | shouldParsePayload = rightToMaybe payload
                   | otherwise = Nothing
   path            = pathInfo req
   method          = requestMethod req
@@ -270,9 +269,9 @@ type CsvData = V.Vector (M.HashMap Text BL.ByteString)
   The reason for its odd signature is so that it can compose
   directly with CSV.decodeByName
 -}
-csvToJson :: (CSV.Header, CsvData) -> JSON.Array
+csvToJson :: (CSV.Header, CsvData) -> JSON.Value
 csvToJson (_, vals) =
-  V.map rowToJsonObj vals
+  JSON.Array $ V.map rowToJsonObj vals
  where
   rowToJsonObj = JSON.Object .
     M.map (\str ->
@@ -281,27 +280,26 @@ csvToJson (_, vals) =
           else JSON.String $ toS str
       )
 
--- | Convert {foo} to [{foo}], leave arrays unchanged
--- and truncate everything else to an empty array.
-pluralize :: JSON.Value -> JSON.Array
-pluralize obj@(JSON.Object _) = V.singleton obj
-pluralize (JSON.Array arr)    = arr
-pluralize _                   = V.empty
+payloadAttributes :: RequestBody -> JSON.Value -> Maybe PayloadJSON
+payloadAttributes raw json =
+  -- Test that Array contains only Objects having the same keys
+  case json of
+    JSON.Array arr ->
+      case arr V.!? 0 of
+        Just (JSON.Object o) ->
+          let canonicalKeys = S.fromList $ M.keys o
+              areKeysUniform = all (\case
+                JSON.Object x -> S.fromList (M.keys x) == canonicalKeys
+                _ -> False) arr in
+          if areKeysUniform
+            then Just $ PayloadJSON raw (PJArray $ V.length arr) canonicalKeys
+            else Nothing
+        Just _ -> Nothing
+        Nothing -> Just emptyPJArray
 
--- | Test that Array contains only Objects having the same keys
--- and if so mark it as PayloadJSON
-ensureUniform :: JSON.Array -> Maybe PayloadJSON
-ensureUniform arr =
-  let objs :: V.Vector JSON.Object
-      objs = foldr -- filter non-objects, map to raw objects
-               (\val result -> case val of
-                  JSON.Object o -> V.cons o result
-                  _ -> result)
-               V.empty arr
-      keysPerObj = V.map (S.fromList . M.keys) objs
-      canonicalKeys = fromMaybe S.empty $ keysPerObj V.!? 0
-      areKeysUniform = all (==canonicalKeys) keysPerObj in
+    JSON.Object o -> Just $ PayloadJSON raw PJObject (S.fromList $ M.keys o)
 
-  if (V.length objs == V.length arr) && areKeysUniform
-    then Just (PayloadJSON objs)
-    else Nothing
+    -- truncate everything else to an empty array.
+    _ -> Just emptyPJArray
+  where
+    emptyPJArray = PayloadJSON (JSON.encode emptyArray) (PJArray 0) S.empty

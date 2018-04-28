@@ -2,12 +2,12 @@
 module PostgREST.Types where
 import           Protolude
 import qualified GHC.Show
-import           Data.Aeson
+import qualified Data.Aeson           as JSON
 import qualified Data.ByteString.Lazy as BL
 import qualified Data.CaseInsensitive as CI
 import qualified Data.HashMap.Strict  as M
+import qualified Data.Set                  as S
 import           Data.Tree
-import qualified Data.Vector          as V
 import           PostgREST.RangeQuery (NonnegRange)
 import           Network.HTTP.Types.Header (hContentType, Header)
 
@@ -23,29 +23,44 @@ data ApiRequestError = ActionInappropriate
                      | UnknownRelation
                      | NoRelationBetween Text Text
                      | UnsupportedVerb
+                     | InvalidFilters
                      deriving (Show, Eq)
+
+data PreferResolution = MergeDuplicates | IgnoreDuplicates deriving Eq
+instance Show PreferResolution where
+  show MergeDuplicates  = "resolution=merge-duplicates"
+  show IgnoreDuplicates = "resolution=ignore-duplicates"
 
 data DbStructure = DbStructure {
   dbTables      :: [Table]
 , dbColumns     :: [Column]
 , dbRelations   :: [Relation]
 , dbPrimaryKeys :: [PrimaryKey]
-, dbProcs       :: M.HashMap Text ProcDescription
+-- ProcDescription is a list because a function can be overloaded
+, dbProcs       :: M.HashMap Text [ProcDescription]
 , pgVersion     :: PgVersion
 } deriving (Show, Eq)
+
+-- TODO Table could hold references to all its Columns
+tableCols :: DbStructure -> Schema -> TableName -> [Column]
+tableCols dbs tSchema tName = filter (\Column{colTable=Table{tableSchema=s, tableName=t}} -> s==tSchema && t==tName) $ dbColumns dbs
+
+-- TODO Table could hold references to all its PrimaryKeys
+tablePKCols :: DbStructure -> Schema -> TableName -> [Text]
+tablePKCols dbs tSchema tName =  pkName <$> filter (\pk -> tSchema == (tableSchema . pkTable) pk && tName == (tableName . pkTable) pk) (dbPrimaryKeys dbs)
 
 data PgArg = PgArg {
   pgaName :: Text
 , pgaType :: Text
 , pgaReq  :: Bool
-} deriving (Show, Eq)
+} deriving (Show, Eq, Ord)
 
-data PgType = Scalar QualifiedIdentifier | Composite QualifiedIdentifier deriving (Eq, Show)
+data PgType = Scalar QualifiedIdentifier | Composite QualifiedIdentifier deriving (Eq, Show, Ord)
 
-data RetType = Single PgType | SetOf PgType deriving (Eq, Show)
+data RetType = Single PgType | SetOf PgType deriving (Eq, Show, Ord)
 
 data ProcVolatility = Volatile | Stable | Immutable
-  deriving (Eq, Show)
+  deriving (Eq, Show, Ord)
 
 data ProcDescription = ProcDescription {
   pdName        :: Text
@@ -55,11 +70,17 @@ data ProcDescription = ProcDescription {
 , pdVolatility  :: ProcVolatility
 } deriving (Show, Eq)
 
+-- Order by least number of args in the case of overloaded functions
+instance Ord ProcDescription where
+  ProcDescription name1 des1 args1 rt1 vol1 `compare` ProcDescription name2 des2 args2 rt2 vol2
+    | name1 == name2 && length args1 < length args2  = LT
+    | name1 == name2 && length args1 > length args2  = GT
+    | otherwise = (name1, des1, args1, rt1, vol1) `compare` (name2, des2, args2, rt2, vol2)
+
 type Schema = Text
 type TableName = Text
 type SqlQuery = Text
 type SqlFragment = Text
-type RequestBody = BL.ByteString
 
 data Table = Table {
   tableSchema      :: Schema
@@ -86,7 +107,9 @@ data Column =
     , colFK          :: Maybe ForeignKey
     } deriving (Show, Ord)
 
-type Synonym = (Column,Column)
+-- | A view column that refers to a table column
+type Synonym = (Column, ViewColumn)
+type ViewColumn = Column
 
 data PrimaryKey = PrimaryKey {
     pkTable :: Table
@@ -112,7 +135,7 @@ data OrderTerm = OrderTerm {
 data QualifiedIdentifier = QualifiedIdentifier {
   qiSchema :: Schema
 , qiName   :: TableName
-} deriving (Show, Eq)
+} deriving (Show, Eq, Ord)
 
 
 data RelationType = Child | Parent | Many | Root deriving (Show, Eq)
@@ -128,18 +151,29 @@ data Relation = Relation {
 , relFTable   :: Table
 , relFColumns :: [Column]
 , relType     :: RelationType
-, relLTable   :: Maybe Table
-, relLCols1   :: Maybe [Column]
-, relLCols2   :: Maybe [Column]
+-- The Link attrs are used when RelationType == Many
+, relLinkTable   :: Maybe Table
+, relLinkCols1   :: Maybe [Column]
+, relLinkCols2   :: Maybe [Column]
 } deriving (Show, Eq)
 
--- | An array of JSON objects that has been verified to have
--- the same keys in every object
-newtype PayloadJSON = PayloadJSON (V.Vector Object)
-  deriving (Show, Eq)
+-- | Cached attributes of a JSON payload
+data PayloadJSON = PayloadJSON {
+-- | This is the raw ByteString that comes from the request body.
+-- We cache this instead of an Aeson Value because it was detected that for large payloads the encoding
+-- had high memory usage, see #1005 for more details
+  pjRaw     :: BL.ByteString
+, pjType    :: PJType
+-- | Keys of the object or if it's an array these keys are guaranteed to be the same across all its objects
+, pjKeys    :: S.Set Text
+} deriving (Show, Eq)
 
-unPayloadJSON :: PayloadJSON -> V.Vector Object
-unPayloadJSON (PayloadJSON objs) = objs
+data PJType = PJArray { pjaLength :: Int } | PJObject deriving (Show, Eq)
+
+-- | e.g. whether it is []/{} or not
+pjIsEmpty :: PayloadJSON -> Bool
+pjIsEmpty (PayloadJSON _ PJObject keys) = S.size keys == 0
+pjIsEmpty (PayloadJSON _ (PJArray l) _) = l == 0
 
 data Proxy = Proxy {
   proxyScheme     :: Text
@@ -184,8 +218,7 @@ ftsOperators = M.fromList [
 data OpExpr = OpExpr Bool Operation deriving (Eq, Show)
 data Operation = Op Operator SingleVal |
                  In ListVal |
-                 Fts Operator (Maybe Language) SingleVal |
-                 Join QualifiedIdentifier ForeignKey deriving (Eq, Show)
+                 Fts Operator (Maybe Language) SingleVal deriving (Eq, Show)
 type Language = Text
 
 -- | Represents a single value in a filter, e.g. id=eq.singleval
@@ -224,10 +257,10 @@ type RpcQParam = (Text, Text)
 -}
 newtype GucHeader = GucHeader (Text, Text)
 
-instance FromJSON GucHeader where
-  parseJSON (Object o) = case headMay (M.toList o) of
-    Just (k, String s) | M.size o == 1 -> pure $ GucHeader (k, s)
-                       | otherwise     -> mzero
+instance JSON.FromJSON GucHeader where
+  parseJSON (JSON.Object o) = case headMay (M.toList o) of
+    Just (k, JSON.String s) | M.size o == 1 -> pure $ GucHeader (k, s)
+                            | otherwise     -> mzero
     _ -> mzero
   parseJSON _          = mzero
 
@@ -243,13 +276,17 @@ type SelectItem = (Field, Maybe Cast, Maybe Alias, Maybe RelationDetail)
 -- | Path of the embedded levels, e.g "clients.projects.name=eq.." gives Path ["clients", "projects"]
 type EmbedPath = [Text]
 data Filter = Filter { field::Field, opExpr::OpExpr } deriving (Show, Eq)
+data JoinCondition = JoinCondition (QualifiedIdentifier, Maybe Alias, FieldName)
+                                   (QualifiedIdentifier, Maybe Alias, FieldName) deriving (Show, Eq)
 
-data ReadQuery = Select { select::[SelectItem], from::[TableName], where_::[LogicTree], order::Maybe [OrderTerm], range_::NonnegRange } deriving (Show, Eq)
-data MutateQuery = Insert { in_::TableName, qPayload::PayloadJSON, returning::[FieldName] }
+data ReadQuery = Select { select::[SelectItem], from::[TableName], where_::[LogicTree], joinConditions::[JoinCondition], order::[OrderTerm], range_::NonnegRange } deriving (Show, Eq)
+data MutateQuery = Insert { in_::TableName, insPkCols::[Text], qPayload::PayloadJSON, onConflict:: Maybe PreferResolution, where_::[LogicTree], returning::[FieldName] }
                  | Delete { in_::TableName, where_::[LogicTree], returning::[FieldName] }
                  | Update { in_::TableName, qPayload::PayloadJSON, where_::[LogicTree], returning::[FieldName] } deriving (Show, Eq)
-type ReadNode = (ReadQuery, (NodeName, Maybe Relation, Maybe Alias, Maybe RelationDetail))
+type ReadNode = (ReadQuery, (NodeName, Maybe Relation, Maybe Alias, Maybe RelationDetail, Depth))
 type ReadRequest = Tree ReadNode
+-- Depth of the ReadRequest tree
+type Depth = Integer
 type MutateRequest = MutateQuery
 data DbRequest = DbRead ReadRequest | DbMutate MutateRequest
 

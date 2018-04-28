@@ -6,8 +6,8 @@ import SpecHelper
 import qualified Hasql.Pool as P
 
 import PostgREST.App (postgrest)
-import PostgREST.Config (pgVersion96)
-import PostgREST.DbStructure (getDbStructure, getPgVersion)
+import PostgREST.Config (pgVersion95, pgVersion96, configSettings)
+import PostgREST.DbStructure (getDbStructure, getPgVersion, fillSessionWithSettings)
 import PostgREST.Types (DbStructure(..))
 import Data.Function (id)
 import Data.IORef
@@ -32,6 +32,7 @@ import qualified Feature.AndOrParamsSpec
 import qualified Feature.RpcSpec
 import qualified Feature.NonexistentSchemaSpec
 import qualified Feature.PgVersion96Spec
+import qualified Feature.UpsertSpec
 
 import Protolude
 
@@ -58,10 +59,13 @@ main = do
       asymJwkApp           = return $ postgrest (testCfgAsymJWK testDbConn)     refDbStructure pool $ pure ()
       nonexistentSchemaApp = return $ postgrest (testNonexistentSchemaCfg testDbConn)   refDbStructure pool $ pure ()
 
-  let reset = resetDb testDbConn
+  let reset :: IO ()
+      reset = P.use pool (fillSessionWithSettings (configSettings $ testCfg testDbConn)) >> resetDb testDbConn
+
       actualPgVersion = pgVersion dbStructure
-      pg96spec | actualPgVersion >= pgVersion96 = [("Feature.PgVersion96Spec"  , Feature.PgVersion96Spec.spec)]
-               | otherwise = []
+      extraSpecs =
+        [("Feature.UpsertSpec", Feature.UpsertSpec.spec) | actualPgVersion >= pgVersion95] ++
+        [("Feature.PgVersion96Spec", Feature.PgVersion96Spec.spec) | actualPgVersion >= pgVersion96]
 
       specs = uncurry describe <$> [
           ("Feature.AuthSpec"               , Feature.AuthSpec.spec)
@@ -76,7 +80,7 @@ main = do
         , ("Feature.StructureSpec"          , Feature.StructureSpec.spec)
         , ("Feature.AndOrParamsSpec"        , Feature.AndOrParamsSpec.spec)
         , ("Feature.NonexistentSchemaSpec"  , Feature.NonexistentSchemaSpec.spec)
-        ] ++ pg96spec
+        ] ++ extraSpecs
 
   hspec $ do
     mapM_ (beforeAll_ reset . before withApp) specs

@@ -49,6 +49,12 @@ spec = do
           , matchHeaders = [matchContentTypeJson]
           }
 
+    context "non uniform json array" $ do
+      it "rejects json array that isn't exclusivily composed of objects" $
+        post "/articles" [json| [{"id": 100, "body": "xxxxx"}, 123, "xxxx", {"id": 111, "body": "xxxx"}] |] `shouldRespondWith` 400
+      it "rejects json array that has objects with different keys" $
+        post "/articles" [json| [{"id": 100, "body": "xxxxx"}, {"id": 111, "body": "xxxx", "owner": "me"}] |] `shouldRespondWith` 400
+
     context "requesting full representation" $ do
       it "includes related data after insert" $
         request methodPost "/projects?select=id,name,clients{id,name}"
@@ -416,7 +422,7 @@ spec = do
         -- put value back for other tests
         void $ request methodPatch "/items?id=eq.99" [] [json| { "id":1 } |]
 
-      it "makes no updates and returns 204, when patching with an empty json object" $ do
+      it "makes no updates and returns 204, when patching with an empty json object/array" $ do
         request methodPatch "/items" [] [json| {} |]
           `shouldRespondWith` ""
           {
@@ -424,8 +430,16 @@ spec = do
             matchHeaders = ["Content-Range" <:> "*/*"]
           }
 
-        g <- get "/items"
-        liftIO $ simpleBody g `shouldBe` [json| [{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{id:16},{"id":2},{"id":1}] |]
+        request methodPatch "/items" [] [json| [] |]
+          `shouldRespondWith` ""
+          {
+            matchStatus  = 204,
+            matchHeaders = ["Content-Range" <:> "*/*"]
+          }
+
+        get "/items" `shouldRespondWith`
+          [json|[{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{id:16},{"id":2},{"id":1}]|]
+          { matchHeaders = [matchContentTypeJson] }
 
       it "makes no updates and and returns 200, when patching with an empty json object and return=rep" $ do
         request methodPatch "/items" [("Prefer", "return=representation")] [json| {} |]
@@ -434,10 +448,10 @@ spec = do
             matchStatus  = 200,
             matchHeaders = ["Content-Range" <:> "*/*"]
           }
-
-        g <- get "/items"
-        liftIO $ simpleBody g `shouldBe` [json| [{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{id:16},{"id":2},{"id":1}] |]
-
+        get "/items" `shouldRespondWith`
+          [json| [{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{id:16},{"id":2},{"id":1}] |]
+          { matchHeaders = [matchContentTypeJson] }
+  
     context "with unicode values" $
       it "succeeds and returns values intact" $ do
         void $ request methodPost "/no_pk" []

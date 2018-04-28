@@ -8,14 +8,14 @@ import           Data.Text                     (intercalate, replace, strip)
 import           Data.List                     (init, last)
 import           Data.Tree
 import           Data.Either.Combinators       (mapLeft)
-import           PostgREST.RangeQuery          (NonnegRange,allRange)
+import           PostgREST.RangeQuery          (NonnegRange)
 import           PostgREST.Types
 import           Text.ParserCombinators.Parsec hiding (many, (<|>))
 import           Text.Parsec.Error
 
-pRequestSelect :: Text -> Text -> Either ApiRequestError ReadRequest
-pRequestSelect rootName selStr =
-  mapError $ parse (pReadRequest rootName) ("failed to parse select parameter (" <> toS selStr <> ")") (toS selStr)
+pRequestSelect :: Text -> Either ApiRequestError [Tree SelectItem]
+pRequestSelect selStr =
+  mapError $ parse pFieldForest ("failed to parse select parameter (" <> toS selStr <> ")") (toS selStr)
 
 pRequestFilter :: (Text, Text) -> Either ApiRequestError (EmbedPath, Filter)
 pRequestFilter (k, v) = mapError $ (,) <$> path <*> (Filter <$> fld <*> oper)
@@ -47,32 +47,11 @@ pRequestLogicTree (k, v) = mapError $ (,) <$> embedPath <*> logicTree
     -- Concat op and v to make pLogicTree argument regular, in the form of "?and=and(.. , ..)" instead of "?and=(.. , ..)"
     logicTree = join $ parse pLogicTree ("failed to parse logic tree (" ++ toS v ++ ")") . toS <$> ((<>) <$> op <*> pure v)
 
-pRequestRpcQParam :: (Text, Text) -> Either ApiRequestError RpcQParam
-pRequestRpcQParam (k, v) = mapError $ (,) <$> name <*> val
-  where
-    name = parse pFieldName ("failed to parse rpc arg name (" ++ toS k ++ ")") $ toS k
-    val = toS <$> parse (many anyChar) ("failed to parse rpc arg value (" ++ toS v ++ ")") v
-
 ws :: Parser Text
 ws = toS <$> many (oneOf " \t")
 
 lexeme :: Parser a -> Parser a
 lexeme p = ws *> p <* ws
-
-pReadRequest :: Text -> Parser ReadRequest
-pReadRequest rootNodeName = do
-  fieldTree <- pFieldForest
-  return $ foldr treeEntry (Node (readQuery, (rootNodeName, Nothing, Nothing, Nothing)) []) fieldTree
-  where
-    readQuery = Select [] [rootNodeName] [] Nothing allRange
-    treeEntry :: Tree SelectItem -> ReadRequest -> ReadRequest
-    treeEntry (Node fld@((fn, _),_,alias,relationDetail) fldForest) (Node (q, i) rForest) =
-      case fldForest of
-        [] -> Node (q {select=fld:select q}, i) rForest
-        _  -> Node (q, i) newForest
-          where
-            newForest =
-              foldr treeEntry (Node (Select [] [fn] [] Nothing allRange, (fn, Nothing, alias, relationDetail)) []) fldForest:rForest
 
 pTreePath :: Parser (EmbedPath, Field)
 pTreePath = do
@@ -82,15 +61,14 @@ pTreePath = do
 
 pFieldForest :: Parser [Tree SelectItem]
 pFieldForest = pFieldTree `sepBy1` lexeme (char ',')
-
-pFieldTree :: Parser (Tree SelectItem)
-pFieldTree =  try (Node <$> pRelationSelect <*> between (char '{') (char '}') pFieldForest) -- TODO: "{}" deprecated
-          <|> try (Node <$> pRelationSelect <*> between (char '(') (char ')') pFieldForest)
-          <|> Node <$> pFieldSelect <*> pure []
+  where
+    pFieldTree :: Parser (Tree SelectItem)
+    pFieldTree =  try (Node <$> pRelationSelect <*> between (char '{') (char '}') pFieldForest) -- TODO: "{}" deprecated
+              <|> try (Node <$> pRelationSelect <*> between (char '(') (char ')') pFieldForest)
+              <|> Node <$> pFieldSelect <*> pure []
 
 pStar :: Parser Text
 pStar = toS <$> (string "*" *> pure ("*"::ByteString))
-
 
 pFieldName :: Parser Text
 pFieldName = do
