@@ -1,17 +1,18 @@
 module Feature.AndOrParamsSpec where
-import Test.Hspec
-import Test.Hspec.Wai
-import Test.Hspec.Wai.JSON
-import Network.HTTP.Types
 
 import Network.Wai (Application)
 
+import Network.HTTP.Types
+import Test.Hspec
+import Test.Hspec.Wai
+import Test.Hspec.Wai.JSON
+
+import PostgREST.Types (PgVersion, pgVersion112)
+import Protolude       hiding (get)
 import SpecHelper
-import Protolude hiding (get)
 
-
-spec :: SpecWith Application
-spec =
+spec :: PgVersion -> SpecWith Application
+spec actualPgVersion =
   describe "and/or params used for complex boolean logic" $ do
     context "used with GET" $ do
       context "or param" $ do
@@ -27,13 +28,13 @@ spec =
 
       context "embedded levels" $ do
         it "can do logic on the second level" $
-          get "/entities?child_entities.or=(id.eq.1,name.eq.child entity 2)&select=id,child_entities{id}" `shouldRespondWith`
+          get "/entities?child_entities.or=(id.eq.1,name.eq.child entity 2)&select=id,child_entities(id)" `shouldRespondWith`
             [json|[
               {"id": 1, "child_entities": [ { "id": 1 }, { "id": 2 } ] }, { "id": 2, "child_entities": []},
               {"id": 3, "child_entities": []}, {"id": 4, "child_entities": []}
             ]|] { matchHeaders = [matchContentTypeJson] }
         it "can do logic on the third level" $
-          get "/entities?child_entities.grandchild_entities.or=(id.eq.1,id.eq.2)&select=id,child_entities{id,grandchild_entities{id}}" `shouldRespondWith`
+          get "/entities?child_entities.grandchild_entities.or=(id.eq.1,id.eq.2)&select=id,child_entities(id,grandchild_entities(id))" `shouldRespondWith`
             [json|[
               {"id": 1, "child_entities": [ { "id": 1, "grandchild_entities": [ { "id": 1 }, { "id": 2 } ]}, { "id": 2, "grandchild_entities": []}]},
               {"id": 2, "child_entities": [ { "id": 3, "grandchild_entities": []} ]},
@@ -79,14 +80,21 @@ spec =
               {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" },
               {"text_search_vector": "'art':4 'spass':5 'unmog':7"}
             ]|] { matchHeaders = [matchContentTypeJson] }
-          -- TODO: remove in 0.5.0 as deprecated
-          get "/entities?or=(text_search_vector.@@.bar,text_search_vector.@@.baz)&select=id" `shouldRespondWith`
-            [json|[{ "id": 1 }, { "id": 2 }]|] { matchHeaders = [matchContentTypeJson] }
-        it "can handle cs and cd" $ do
+
+        when (actualPgVersion >= pgVersion112) $
+          it "can handle wfts (websearch_to_tsquery)" $
+            get "/tsearch?or=(text_search_vector.plfts(german).Art,text_search_vector.plfts(french).amusant,text_search_vector.not.wfts(english).impossible)"
+            `shouldRespondWith`
+              [json|[
+                     {"text_search_vector": "'also':2 'fun':3 'possibl':8" },
+                     {"text_search_vector": "'ate':3 'cat':2 'fat':1 'rat':4" },
+                     {"text_search_vector": "'amus':5 'fair':7 'impossibl':9 'peu':4" },
+                     {"text_search_vector": "'art':4 'spass':5 'unmog':7" }
+              ]|]
+              { matchHeaders = [matchContentTypeJson] }
+
+        it "can handle cs and cd" $
           get "/entities?or=(arr.cs.{1,2,3},arr.cd.{1})&select=id" `shouldRespondWith`
-            [json|[{ "id": 1 },{ "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
-          -- TODO: remove in 0.5.0 as deprecated
-          get "/entities?or=(arr.@>.{1,2,3},arr.<@.{1})&select=id" `shouldRespondWith`
             [json|[{ "id": 1 },{ "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
 
         it "can handle range operators" $ do
@@ -119,24 +127,43 @@ spec =
           get "/ranges?range=adj.(3,10]&select=id" `shouldRespondWith`
             [json|[{ "id": 1 }]|] { matchHeaders = [matchContentTypeJson] }
 
+        it "can handle array operators" $ do
+          get "/entities?arr=eq.{1,2,3}&select=id" `shouldRespondWith`
+            [json|[{ "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=neq.{1,2}&select=id" `shouldRespondWith`
+            [json|[{ "id": 1 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=lt.{2,3}&select=id" `shouldRespondWith`
+            [json|[{ "id": 1 }, { "id": 2 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=lt.{2,0}&select=id" `shouldRespondWith`
+            [json|[{ "id": 1 }, { "id": 2 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=gt.{1,1}&select=id" `shouldRespondWith`
+            [json|[{ "id": 2 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=gt.{3}&select=id" `shouldRespondWith`
+            [json|[]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=lte.{2,1}&select=id" `shouldRespondWith`
+            [json|[{ "id": 1 }, { "id": 2 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=lte.{1,2,3}&select=id" `shouldRespondWith`
+            [json|[{ "id": 1 }, { "id": 2 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=lte.{1,2}&select=id" `shouldRespondWith`
+            [json|[{ "id": 1 }, { "id": 2 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=cs.{1,2}&select=id" `shouldRespondWith`
+            [json|[{ "id": 2 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=cd.{1,2,6}&select=id" `shouldRespondWith`
+            [json|[{ "id": 1 }, { "id": 2 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=ov.{3}&select=id" `shouldRespondWith`
+            [json|[{ "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+          get "/entities?arr=ov.{2,3}&select=id" `shouldRespondWith`
+            [json|[{ "id": 2 }, { "id": 3 }]|] { matchHeaders = [matchContentTypeJson] }
+
         context "operators with not" $ do
-          it "eq, cs, like can be negated" $ do
+          it "eq, cs, like can be negated" $
             get "/entities?and=(arr.not.cs.{1,2,3},and(id.not.eq.2,name.not.like.*3))&select=id" `shouldRespondWith`
               [json|[{ "id": 1}]|] { matchHeaders = [matchContentTypeJson] }
-            -- TODO: remove in 0.5.0 as deprecated
-            get "/entities?and=(arr.not.@>.{1,2,3},and(id.not.eq.2,name.not.like.*3))&select=id" `shouldRespondWith`
-              [json|[{ "id": 1}]|] { matchHeaders = [matchContentTypeJson] }
-          it "in, is, fts can be negated" $ do
+          it "in, is, fts can be negated" $
             get "/entities?and=(id.not.in.(1,3),and(name.not.is.null,text_search_vector.not.fts.foo))&select=id" `shouldRespondWith`
               [json|[{ "id": 2}]|] { matchHeaders = [matchContentTypeJson] }
-            -- TODO: remove in 0.5.0 as deprecated
-            get "/entities?and=(id.not.in.(1,3),and(name.not.is.null,text_search_vector.not.@@.foo))&select=id" `shouldRespondWith`
-              [json|[{ "id": 2}]|] { matchHeaders = [matchContentTypeJson] }
-          it "lt, gte, cd can be negated" $ do
+          it "lt, gte, cd can be negated" $
             get "/entities?and=(arr.not.cd.{1},or(id.not.lt.1,id.not.gte.3))&select=id" `shouldRespondWith`
-              [json|[{"id": 2}, {"id": 3}]|] { matchHeaders = [matchContentTypeJson] }
-            -- TODO: remove in 0.5.0 as deprecated
-            get "/entities?and=(arr.not.<@.{1},or(id.not.lt.1,id.not.gte.3))&select=id" `shouldRespondWith`
               [json|[{"id": 2}, {"id": 3}]|] { matchHeaders = [matchContentTypeJson] }
           it "gt, lte, ilike can be negated" $
             get "/entities?and=(name.not.ilike.*ITY2,or(id.not.gt.4,id.not.lte.1))&select=id" `shouldRespondWith`
@@ -182,7 +209,7 @@ spec =
 
     context "used with POST" $
       it "includes related data with filters" $
-        request methodPost "/child_entities?entities.or=(id.eq.2,id.eq.3)&select=id,entities{id}"
+        request methodPost "/child_entities?select=id,entities(id)&entities.or=(id.eq.2,id.eq.3)&entities.order=id"
           [("Prefer", "return=representation")]
           [json|[{"id":4,"name":"entity 4","parent_id":1},
                  {"id":5,"name":"entity 5","parent_id":2},
@@ -207,10 +234,6 @@ spec =
 
     it "can query columns that begin with and/or reserved words" $
       get "/grandchild_entities?or=(and_starting_col.eq.smth, or_starting_col.eq.smth)" `shouldRespondWith` 200
-
-    it "can query jsonb columns" $
-      get "/grandchild_entities?or=(jsonb_col->a->>b.eq.foo, jsonb_col->>b.eq.bar)&select=id" `shouldRespondWith`
-        [json|[{id: 4}, {id: 5}]|] { matchStatus = 200, matchHeaders = [matchContentTypeJson] }
 
     it "fails when using IN without () and provides meaningful error message" $
       get "/entities?or=(id.in.1,2,id.eq.3)" `shouldRespondWith`

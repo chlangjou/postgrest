@@ -1,20 +1,49 @@
-![Logo](static/logo.png "Logo")
+![Logo](static/bigger-logo.png "Logo")
 
-[![Build Status](https://circleci.com/gh/begriffs/postgrest.png?style=shield&circle-token=f723c01686abf0364de1e2eaae5aff1f68bd3ff2)](https://circleci.com/gh/begriffs/postgrest/tree/master)
-<a href="https://heroku.com/deploy?template=https://github.com/begriffs/postgrest">
+[![Donate](https://img.shields.io/badge/Donate-Patreon-orange.svg?colorB=F96854)](https://www.patreon.com/postgrest)
+[![Donate](https://img.shields.io/badge/Donate-PayPal-green.svg)](https://www.paypal.me/postgrest)
+<a href="https://heroku.com/deploy?template=https://github.com/PostgREST/postgrest">
   <img src="https://img.shields.io/badge/%E2%86%91_Deploy_to-Heroku-7056bf.svg" alt="Deploy">
 </a>
 [![Join the chat at https://gitter.im/begriffs/postgrest](https://img.shields.io/badge/gitter-join%20chat%20%E2%86%92-brightgreen.svg)](https://gitter.im/begriffs/postgrest)
-[![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](http://postgrest.com)
+[![Docs](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](http://postgrest.org)
 [![Docker Stars](https://img.shields.io/docker/pulls/postgrest/postgrest.svg)](https://hub.docker.com/r/postgrest/postgrest/)
+[![Build Status](https://circleci.com/gh/PostgREST/postgrest/tree/master.svg?style=shield)](https://circleci.com/gh/PostgREST/postgrest/tree/master)
+[![Hackage docs](https://img.shields.io/hackage/v/postgrest.svg?label=hackage)](http://hackage.haskell.org/package/postgrest)
 
 PostgREST serves a fully RESTful API from any existing PostgreSQL
 database. It provides a cleaner, more standards-compliant, faster
 API than you are likely to write from scratch.
 
-### Usage
+## Sponsors
 
-1. Download the binary ([latest release](https://github.com/begriffs/postgrest/releases/latest))
+<table>
+  <tbody>
+    <tr>
+      <td align="center" valign="middle">
+        <a href="https://www.cybertec-postgresql.com/en/" target="_blank">
+          <img width="222px" src="static/cybertec.png">
+        </a>
+      </td>
+      <td align="center" valign="middle">
+        <a href="https://www.2ndquadrant.com/en/?utm_campaign=External%20Websites&utm_source=PostgREST&utm_medium=Logo" target="_blank">
+          <img width="222px" src="static/2ndquadrant.png">
+        </a>
+      </td>
+      <td align="center" valign="middle">
+        <a href="https://tryretool.com/?utm_source=sponsor&utm_campaign=postgrest" target="_blank">
+          <img width="222px" src="static/retool.png">
+        </a>
+      </td>
+    </tr>
+  </tbody>
+</table>
+
+Big thanks to our sponsors! You can join them by supporting PostgREST on [Patreon](https://www.patreon.com/postgrest).
+
+## Usage
+
+1. Download the binary ([latest release](https://github.com/PostgREST/postgrest/releases/latest))
    for your platform.
 2. Invoke for help:
 
@@ -22,7 +51,7 @@ API than you are likely to write from scratch.
     postgrest --help
     ```
 
-### Performance
+## Performance
 
 TLDR; subsecond response times for up to 2000 requests/sec on Heroku
 free tier. If you're used to servers written in interpreted languages
@@ -50,13 +79,10 @@ by
 * Using the PostgreSQL binary protocol
 * Being stateless to allow horizontal scaling
 
-Other optimizations are possible, and some are outlined in the
-[Future Features](#future-features).
-
-### Security
+## Security
 
 PostgREST [handles
-authentication](http://postgrest.com/en/stable/auth.html) (via JSON Web
+authentication](http://postgrest.org/en/stable/auth.html) (via JSON Web
 Tokens) and delegates authorization to the role information defined in
 the database. This ensures there is a single declarative source of truth
 for security.  When dealing with the database the server assumes the
@@ -74,7 +100,7 @@ are limited to certain templates using
 functions, the trigger workaround does not compromise row-level
 security.
 
-### Versioning
+## Versioning
 
 A robust long-lived API needs the freedom to exist in multiple
 versions. PostgREST does versioning through database schemas. This
@@ -82,7 +108,7 @@ allows you to expose tables and views without making the app brittle.
 Underlying tables can be superseded and hidden behind public facing
 views.
 
-### Self-documentation
+## Self-documentation
 
 PostgREST uses the [OpenAPI](https://openapis.org/) standard to
 generate up-to-date documentation for APIs. You can use a tool like
@@ -94,7 +120,7 @@ instance the number of rows returned by an endpoint is reported by -
 and limited with - range headers. More about
 [that](http://begriffs.com/posts/2014-03-06-beyond-http-header-links.html).
 
-### Data Integrity
+## Data Integrity
 
 Rather than relying on an Object Relational Mapper and custom
 imperative coding, this system requires you put declarative constraints
@@ -106,14 +132,24 @@ surprises, such as enforcing idempotent PUT requests.
 
 See examples of [PostgreSQL
 constraints](http://www.tutorialspoint.com/postgresql/postgresql_constraints.htm)
-and the [API guide](http://postgrest.com/en/stable/api.html).
+and the [API guide](http://postgrest.org/en/stable/api.html).
 
-### Thanks
+## Supporting development
 
-I'm grateful to the generous project
-[contributors](https://github.com/begriffs/postgrest/graphs/contributors)
-who have improved PostgREST immensely with their code and good
-judgement.  See more details in the
-[changelog](https://github.com/begriffs/postgrest/blob/master/CHANGELOG.md).
+You can help PostgREST ongoing maintenance and development by:
+
+- Making a regular donation through Patreon https://www.patreon.com/postgrest
+
+- Alternatively, you can make a one-time donation via Paypal https://www.paypal.me/postgrest
+
+Every donation will be spent on making PostgREST better for the whole community.
+
+## Thanks
+
+The PostgREST organization is grateful to:
+
+- The project [sponsors and backers](https://github.com/PostgREST/postgrest/blob/master/BACKERS.md) who support PostgREST's development.
+- The project [contributors](https://github.com/PostgREST/postgrest/graphs/contributors) who have improved PostgREST immensely with their code
+  and good judgement. See more details in the [changelog](https://github.com/PostgREST/postgrest/blob/master/CHANGELOG.md).
 
 The cool logo came from [Mikey Casalaina](https://github.com/casalaina).

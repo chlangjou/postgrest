@@ -17,7 +17,7 @@ CREATE SCHEMA postgrest;
 CREATE SCHEMA private;
 CREATE SCHEMA test;
 CREATE SCHEMA تست;
-
+CREATE SCHEMA extensions;
 
 --
 -- Name: plpgsql; Type: EXTENSION; Schema: -; Owner: -
@@ -116,6 +116,11 @@ CREATE FUNCTION always_true(test.items) RETURNS boolean
     LANGUAGE sql STABLE
     AS $$ SELECT true $$;
 
+CREATE FUNCTION is_first(test.items) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$ SELECT $1.id = 1 $$;
+
+
 CREATE FUNCTION anti_id(test.items) RETURNS bigint
     LANGUAGE sql STABLE
     AS $_$ SELECT $1.id * -1 $_$;
@@ -177,20 +182,6 @@ CREATE FUNCTION noparamsproc() RETURNS text
 	$$;
 
 --
--- Name: insert_insertable_view_with_join(); Type: FUNCTION; Schema: test; Owner: -
---
-
-CREATE FUNCTION insert_insertable_view_with_join() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-begin
-  INSERT INTO test.auto_incrementing_pk (nullable_string, non_nullable_string) VALUES (NEW.nullable_string, NEW.non_nullable_string);
-  RETURN NEW;
-end;
-$$;
-
-
---
 -- Name: login(text, text); Type: FUNCTION; Schema: test; Owner: -
 --
 
@@ -215,13 +206,27 @@ CREATE FUNCTION varied_arguments(
   date date,
   money money,
   enum enum_menagerie_type,
-  "integer" integer default 42
+  "integer" integer default 42,
+  json json default '{}',
+  jsonb jsonb default '{}'
 ) RETURNS text
     LANGUAGE sql
 AS $_$
   SELECT 'Hi'::text;
 $_$;
 
+COMMENT ON FUNCTION varied_arguments(double precision, character varying, boolean, date, money, enum_menagerie_type, integer, json, jsonb) IS
+$_$An RPC function
+
+Just a test for RPC function arguments$_$;
+
+
+CREATE FUNCTION json_argument(arg json) RETURNS text
+
+LANGUAGE sql
+AS $_$
+  SELECT json_typeof(arg);
+$_$;
 
 --
 -- Name: jwt_test(); Type: FUNCTION; Schema: test; Owner: -
@@ -961,13 +966,6 @@ CREATE TRIGGER articles_owner_track BEFORE INSERT OR UPDATE ON articles FOR EACH
 SET search_path = test, pg_catalog;
 
 --
--- Name: insert_insertable_view_with_join; Type: TRIGGER; Schema: test; Owner: -
---
-
-CREATE TRIGGER insert_insertable_view_with_join INSTEAD OF INSERT ON insertable_view_with_join FOR EACH ROW EXECUTE PROCEDURE insert_insertable_view_with_join();
-
-
---
 -- Name: secrets_owner_track; Type: TRIGGER; Schema: test; Owner: -
 --
 
@@ -1111,8 +1109,8 @@ CREATE FUNCTION setprojects(id_l int, id_h int, name text) RETURNS SETOF project
 $_$;
 
 create table images (
-	name               text not null,
-	img                bytea not null
+	name text  not null,
+	img  bytea not null
 );
 
 create view images_base64 as (
@@ -1120,17 +1118,17 @@ create view images_base64 as (
   select name, replace(encode(img, 'base64'), E'\n', '') as img from images
 );
 
-create function test.ret_enum(val text) returns test.enum_menagerie_type as $$ 
+create function test.ret_enum(val text) returns test.enum_menagerie_type as $$
   select val::test.enum_menagerie_type;
 $$ language sql;
 
 create domain one_nine as integer check (value >= 1 and value <= 9);
 
-create function test.ret_array() returns integer[] as $$ 
+create function test.ret_array() returns integer[] as $$
   select '{1,2,3}'::integer[];
 $$ language sql;
 
-create function test.ret_domain(val integer) returns test.one_nine as $$ 
+create function test.ret_domain(val integer) returns test.one_nine as $$
   select val::test.one_nine;
 $$ language sql;
 
@@ -1144,20 +1142,20 @@ $$ language sql;
 
 create function test.ret_scalars() returns table(
   a text, b test.enum_menagerie_type, c test.one_nine, d int4range
-) as $$ 
-  select row('scalars'::text, enum_first(null::test.enum_menagerie_type), 
+) as $$
+  select row('scalars'::text, enum_first(null::test.enum_menagerie_type),
               1::test.one_nine, int4range(10, 20));
 $$ language sql;
 
 create type test.point_2d as (x integer, y integer);
 
-create function test.ret_point_2d() returns test.point_2d as $$ 
+create function test.ret_point_2d() returns test.point_2d as $$
   select row(10, 5)::test.point_2d;
 $$ language sql;
 
 create type private.point_3d as (x integer, y integer, z integer);
 
-create function test.ret_point_3d() returns private.point_3d as $$ 
+create function test.ret_point_3d() returns private.point_3d as $$
   select row(7, -3, 4)::private.point_3d;
 $$ language sql;
 
@@ -1171,17 +1169,17 @@ create function test.ret_rows_with_base64_bin() returns setof test.images_base64
   select i.name, i.img from test.images_base64 i;
 $$ language sql;
 
-create function test.single_article(id integer) returns test.articles as $$ 
+create function test.single_article(id integer) returns test.articles as $$
   select a.* from test.articles a where a.id = $1;
 $$ language sql;
 
-create function test.get_guc_value(name text) returns text as $$ 
+create function test.get_guc_value(name text) returns text as $$
   select nullif(current_setting(name), '')::text;
 $$ language sql;
 
 create table w_or_wo_comma_names ( name text );
 
-create table items_with_different_col_types ( 
+create table items_with_different_col_types (
   int_data integer,
   text_data text,
   bool_data bool,
@@ -1194,20 +1192,20 @@ create table items_with_different_col_types (
 
 -- Tables used for testing complex boolean logic with and/or query params
 
-create table entities ( 
+create table entities (
   id integer primary key,
   name text,
   arr integer[],
   text_search_vector tsvector
 );
 
-create table child_entities ( 
+create table child_entities (
   id integer primary key,
   name text,
   parent_id integer references entities(id)
 );
 
-create table grandchild_entities ( 
+create table grandchild_entities (
   id integer primary key,
   name text,
   parent_id integer references child_entities(id),
@@ -1228,7 +1226,7 @@ create table ranges (
 
 comment on table child_entities is 'child_entities comment';
 comment on column child_entities.id is 'child_entities id comment';
-comment on column child_entities.name is 'child_entities name comment';
+comment on column child_entities.name is 'child_entities name comment. Can be longer than sixty-three characters long';
 
 comment on table grandchild_entities is
 $$grandchild_entities summary
@@ -1382,11 +1380,17 @@ create table test.family_tree (
 );
 alter table only test.family_tree add constraint pptr foreign key (parent) references test.family_tree(id);
 
+create table test.managers (
+  id integer primary key,
+  name text
+);
+
 create table test.organizations (
   id integer primary key,
   name text,
   referee integer,
-  auditor integer
+  auditor integer,
+  manager_id integer references managers(id)
 );
 alter table only test.organizations add constraint pptr1 foreign key (referee) references test.organizations(id);
 alter table only test.organizations add constraint pptr2 foreign key (auditor) references test.organizations(id);
@@ -1396,11 +1400,17 @@ create table private.authors(
   name text
 );
 
+create table private.publishers(
+  id integer primary key,
+  name text
+);
+
 create table private.books(
   id integer primary key,
   title text,
   publication_year smallint,
-  author_id integer references private.authors(id)
+  author_id integer references private.authors(id),
+  first_publisher_id integer references private.publishers(id)
 );
 
 create view test.authors as select id, name from private.authors;
@@ -1435,3 +1445,288 @@ create table zone(
   name text,
   zone_type_id integer,
   space_id integer references space(id));
+
+-- foreign table tests
+create extension file_fdw;
+
+create server import_csv foreign data wrapper file_fdw;
+
+create foreign table projects_dump (
+  id integer,
+  name text,
+  client_id integer
+) server import_csv options ( filename '/tmp/projects_dump.csv', format 'csv');
+
+comment on foreign table projects_dump is
+$$A temporary projects dump
+
+Just a test for foreign tables$$;
+
+create table "UnitTest"(
+  "idUnitTest" integer primary key,
+  "nameUnitTest" text
+);
+
+create table json_arr(
+  id integer primary key,
+  data pg_catalog.json
+);
+
+create table jsonb_test(
+  id integer primary key,
+  data jsonb
+);
+
+create view test.authors_books_number as
+select
+  id,
+  name,
+  (
+    select
+      count(*)
+    from forties_books where author_id = authors.id
+  ) as num_in_forties,
+  (
+    select
+      count(*)
+    from fifties_books where author_id = authors.id
+  ) as num_in_fifties,
+  (
+    select
+      count(*)
+    from sixties_books where author_id = authors.id
+  ) as num_in_sixties,
+  (
+    select
+      count(*)
+    from (
+      select id
+      from forties_books where author_id = authors.id
+      union
+      select id
+      from fifties_books where author_id = authors.id
+      union
+      select id
+      from sixties_books where author_id = authors.id
+    ) _
+  ) as num_in_all_decades
+from private.authors;
+
+create view test.authors_have_book_in_decade as
+select
+  id,
+  name,
+  case
+    when (x.id in (select author_id from test.forties_books))
+    then true
+    else false
+  end as has_book_in_forties,
+  case
+    when (x.id in (select author_id from test.fifties_books))
+    then true
+    else false
+  end as has_book_in_fifties,
+  case
+    when (x.id in (select author_id from test.sixties_books))
+    then true
+    else false
+  end as has_book_in_sixties
+from private.authors x;
+
+create view test.forties_and_fifties_books as
+select x.id, x.title, x.publication_year, y.name as first_publisher, x.author_id
+from (
+  select id, title, publication_year, author_id, first_publisher_id from private.books
+  where publication_year >= 1940 and publication_year < 1960) x
+join private.publishers y on y.id = x.first_publisher_id;
+
+create view test.odd_years_publications as
+with
+odd_years_books as(
+  select id, title, publication_year, author_id, first_publisher_id
+  from private.books
+  where publication_year % 2 <> 0
+)
+select
+  x.id, x.title, x.publication_year,
+  y.name as first_publisher, x.author_id
+from odd_years_books x
+join private.publishers y on y.id = x.first_publisher_id;
+
+create view test.projects_count_grouped_by as
+select
+  client_id,
+  count(id) as number_of_projects
+from projects
+group by client_id;
+
+create view test.authors_w_entities as
+select
+  id,
+  name,
+  (
+    select json_agg(id)
+    from test.entities
+    where id not in (
+      select parent_id from test.child_entities
+    )
+  ) as entities
+from private.authors;
+
+CREATE TABLE test."Foo"(
+  id int primary key,
+  name text
+);
+
+CREATE TABLE test.bar(
+  id int primary key,
+  name text,
+  "fooId" int references "Foo"(id)
+);
+
+CREATE VIEW test.foos as select id,name from "Foo";
+CREATE VIEW test.bars as select id, "fooId", name from bar;
+
+create materialized view materialized_projects as
+select id, name, client_id from projects;
+
+comment on materialized view materialized_projects is
+$$A materialized view for projects
+
+Just a test for materialized views$$;
+
+create or replace function test."quotedFunction"("user" text, "fullName" text, "SSN" text)
+returns jsonb AS $$
+  select format('{"user": "%s", "fullName": "%s", "SSN": "%s"}', "user", "fullName", "SSN")::jsonb;
+$$ language sql;
+
+create table private.player (
+  id integer not null,
+  first_name text not null,
+  last_name text not null,
+  birth_date date,
+  primary key (last_name, id, first_name, birth_date) -- just for testing a long compound pk
+);
+
+create table test.contract (
+  tournament text not null,
+  time tsrange not null,
+  purchase_price int not null,
+  id integer not null,
+  first_name text not null,
+  last_name text not null,
+  birth_date date,
+  foreign key (last_name, id, first_name, birth_date) references private.player
+);
+
+create view test.player_view as select * from private.player;
+
+create view test.contract_view as select * from test.contract;
+
+create type public.my_type AS enum ('something');
+
+create function test.test_arg(my_arg public.my_type) returns text as $$
+  select 'foobar'::text;
+$$ language sql;
+
+create extension if not exists ltree with schema public;
+
+create table test.ltree_sample (
+  path public.ltree
+);
+
+CREATE FUNCTION test.number_of_labels(test.ltree_sample) RETURNS integer AS $$
+  SELECT nlevel($1.path)
+$$ language sql;
+
+create extension if not exists isn with schema extensions;
+
+create table test.isn_sample (
+  id extensions.isbn,
+  name text
+);
+
+create function test.is_valid_isbn(input text) returns boolean as $$
+  select is_valid(input::isbn);
+$$ language sql;
+
+create table "Server Today"(
+  "cHostname" text,
+  "Just A Server Model" text
+);
+
+create table test.pgrst_reserved_chars (
+  "*id*" integer,
+  ":arr->ow::cast" text,
+  "(inside,parens)" text,
+  "a.dotted.column" text,
+  "  col  w  space  " text
+);
+
+CREATE TABLE test.openapi_types(
+  "a_character_varying" character varying,
+  "a_character" character(1),
+  "a_text" text,
+  "a_boolean" boolean,
+  "a_smallint" smallint,
+  "a_integer" integer,
+  "a_bigint" bigint,
+  "a_numeric" numeric,
+  "a_real" real,
+  "a_double_precision" double precision
+);
+
+create function add_them(a integer, b integer)
+returns integer as $$
+  select a + b;
+$$ language sql;
+
+create function root() returns jsonb as $_$
+declare
+openapi jsonb = $$
+  {
+    "swagger": "2.0",
+    "info":{
+      "title":"PostgREST API",
+      "description":"This is a dynamic API generated by PostgREST"
+    }
+  }
+$$;
+simple jsonb = $$
+  [
+    {
+      "table":"items"
+    },
+    {
+      "table":"subitems"
+    }
+  ]
+$$;
+begin
+case current_setting('request.header.accept', true)
+  when 'application/openapi+json' then
+    return openapi;
+  when 'application/json' then
+    return simple;
+  else
+    return openapi;
+  end case;
+end
+$_$ language plpgsql;
+
+create or replace function welcome() returns text as $$
+select 'Welcome to PostgREST'::text;
+$$ language sql;
+
+create or replace function "welcome.html"() returns text as $_$
+select $$
+<html>
+  <head>
+    <title>PostgREST</title>
+  </head>
+  <body>
+    <h1>Welcome to PostgREST</h1>
+  </body>
+</html>
+$$::text;
+$_$ language sql;

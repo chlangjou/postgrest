@@ -5,6 +5,7 @@ GRANT USAGE ON SCHEMA
     , jwt
     , public
     , "تست"
+    , extensions
 TO postgrest_test_anonymous;
 
 -- Schema test objects
@@ -67,6 +68,7 @@ GRANT ALL ON TABLE
     , tiobe_pls
     , only_pk
     , family_tree
+    , managers
     , organizations
     , authors
     , books
@@ -78,6 +80,27 @@ GRANT ALL ON TABLE
     , person_detail
     , space
     , zone
+    , projects_dump
+    , "UnitTest"
+    , json_arr
+    , jsonb_test
+    , authors_books_number
+    , authors_have_book_in_decade
+    , forties_and_fifties_books
+    , odd_years_publications
+    , foos
+    , bars
+    , materialized_projects
+    , contract
+    , player_view
+    , contract_view
+    , ltree_sample
+    , isn_sample
+    , projects_count_grouped_by
+    , "Server Today"
+    , pgrst_reserved_chars
+    , authors_w_entities
+    , openapi_types
 TO postgrest_test_anonymous;
 
 GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;

@@ -1,28 +1,27 @@
 module Feature.InsertSpec where
 
-import Test.Hspec hiding (pendingWith)
+import qualified Data.Aeson as JSON
+
+import Control.Monad          (replicateM_, void)
+import Data.List              (lookup)
+import Data.Maybe             (fromJust)
+import Network.Wai            (Application)
+import Network.Wai.Test       (SResponse (simpleBody, simpleHeaders, simpleStatus))
+import Test.Hspec             hiding (pendingWith)
+import Test.Hspec.Wai.Matcher (bodyEquals)
+import TestTypes              (CompoundPK (..), IncPK (..))
+
+import Network.HTTP.Types
 import Test.Hspec.Wai
 import Test.Hspec.Wai.JSON
-import Test.Hspec.Wai.Matcher (bodyEquals)
-import Network.Wai.Test (SResponse(simpleBody,simpleHeaders,simpleStatus))
+import Text.Heredoc
 
+import PostgREST.Types (PgVersion, pgVersion112)
+import Protolude       hiding (get)
 import SpecHelper
 
-import qualified Data.Aeson as JSON
-import Data.List (lookup)
-import Data.Maybe (fromJust)
-import Text.Heredoc
-import Network.HTTP.Types.Header
-import Network.HTTP.Types
-import Control.Monad (replicateM_, void)
-
-import TestTypes(IncPK(..), CompoundPK(..))
-import Network.Wai (Application)
-
-import Protolude hiding (get)
-
-spec :: SpecWith Application
-spec = do
+spec :: PgVersion -> SpecWith Application
+spec actualPgVersion = do
   describe "Posting new record" $ do
     context "disparate json types" $ do
       it "accepts disparate json types" $ do
@@ -51,13 +50,26 @@ spec = do
 
     context "non uniform json array" $ do
       it "rejects json array that isn't exclusivily composed of objects" $
-        post "/articles" [json| [{"id": 100, "body": "xxxxx"}, 123, "xxxx", {"id": 111, "body": "xxxx"}] |] `shouldRespondWith` 400
+        post "/articles"
+             [json| [{"id": 100, "body": "xxxxx"}, 123, "xxxx", {"id": 111, "body": "xxxx"}] |]
+        `shouldRespondWith`
+             [json| {"message":"All object keys must match"} |]
+             { matchStatus  = 400
+             , matchHeaders = [matchContentTypeJson]
+             }
+
       it "rejects json array that has objects with different keys" $
-        post "/articles" [json| [{"id": 100, "body": "xxxxx"}, {"id": 111, "body": "xxxx", "owner": "me"}] |] `shouldRespondWith` 400
+        post "/articles"
+             [json| [{"id": 100, "body": "xxxxx"}, {"id": 111, "body": "xxxx", "owner": "me"}] |]
+        `shouldRespondWith`
+             [json| {"message":"All object keys must match"} |]
+             { matchStatus  = 400
+             , matchHeaders = [matchContentTypeJson]
+             }
 
     context "requesting full representation" $ do
       it "includes related data after insert" $
-        request methodPost "/projects?select=id,name,clients{id,name}"
+        request methodPost "/projects?select=id,name,clients(id,name)"
                 [("Prefer", "return=representation"), ("Prefer", "count=exact")]
           [str|{"id":6,"name":"New Project","client_id":2}|] `shouldRespondWith` [str|[{"id":6,"name":"New Project","clients":{"id":2,"name":"Apple"}}]|]
           { matchStatus  = 201
@@ -103,11 +115,13 @@ spec = do
             incNullableStr record `shouldBe` Nothing
 
       context "into a table with simple pk" $
-        it "fails with 400 and error" $ do
-          p <- post "/simple_pk" [json| { "extra":"foo"} |]
-          liftIO $ do
-            simpleStatus p `shouldBe` badRequest400
-            isErrorFormat (simpleBody p) `shouldBe` True
+        it "fails with 400 and error" $
+          post "/simple_pk" [json| { "extra":"foo"} |]
+          `shouldRespondWith`
+          [json|{"hint":null,"details":"Failing row contains (null, foo).","code":"23502","message":"null value in column \"k\" violates not-null constraint"}|]
+          { matchStatus  = 400
+          , matchHeaders = [matchContentTypeJson]
+          }
 
       context "into a table with no pk" $ do
         it "succeeds with 201 and a link including all fields" $ do
@@ -181,11 +195,13 @@ spec = do
           lookup hLocation (simpleHeaders p) `shouldBe` Nothing
 
     context "with invalid json payload" $
-      it "fails with 400 and error" $ do
-        p <- post "/simple_pk" "}{ x = 2"
-        liftIO $ do
-          simpleStatus p `shouldBe` badRequest400
-          isErrorFormat (simpleBody p) `shouldBe` True
+      it "fails with 400 and error" $
+        post "/simple_pk" "}{ x = 2"
+        `shouldRespondWith`
+        [json|{"message":"Error in $: Failed reading: not a valid json value"}|]
+        { matchStatus  = 400
+        , matchHeaders = [matchContentTypeJson]
+        }
 
     context "with valid json payload" $
       it "succeeds and returns 201 created" $
@@ -193,7 +209,12 @@ spec = do
 
     context "attempting to insert a row with the same primary key" $
       it "fails returning a 409 Conflict" $
-        post "/simple_pk" [json| { "k":"k1", "extra":"e1" } |] `shouldRespondWith` 409
+        post "/simple_pk" [json| { "k":"k1", "extra":"e1" } |]
+          `shouldRespondWith`
+          [json|{"hint":null,"details":"Key (k)=(k1) already exists.","code":"23505","message":"duplicate key value violates unique constraint \"contacts_pkey\""}|]
+          { matchStatus  = 409
+          , matchHeaders = [matchContentTypeJson]
+          }
 
     context "attempting to insert a row with conflicting unique constraint" $
       it "fails returning a 409 Conflict" $
@@ -222,12 +243,23 @@ spec = do
           , matchHeaders = ["Location" <:> location]
           }
 
-    context "empty object" $
-      it "successfully populates table with all-default columns" $
+    context "empty objects" $ do
+      it "successfully inserts a row with all-default columns" $ do
         post "/items" "{}" `shouldRespondWith` ""
           { matchStatus  = 201
           , matchHeaders = []
           }
+        post "/items" "[{}]" `shouldRespondWith` ""
+          { matchStatus  = 201
+          , matchHeaders = []
+          }
+
+      it "successfully inserts two rows with all-default columns" $
+        post "/items" "[{}, {}]" `shouldRespondWith` ""
+          { matchStatus  = 201
+          , matchHeaders = []
+          }
+
     context "table with limited privileges" $ do
       it "succeeds if correct select is applied" $
         request methodPost "/limited_article_stars?select=article_id,user_id" [("Prefer", "return=representation")]
@@ -237,20 +269,75 @@ spec = do
           }
       it "fails if more columns are selected" $
         request methodPost "/limited_article_stars?select=article_id,user_id,created_at" [("Prefer", "return=representation")]
-          [json| {"article_id": 2, "user_id": 2} |] `shouldRespondWith`
-          [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for relation limited_article_stars"}|]
+          [json| {"article_id": 2, "user_id": 2} |] `shouldRespondWith` (
+        if actualPgVersion >= pgVersion112 then
+        [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for view limited_article_stars"}|]
+           else
+        [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for relation limited_article_stars"}|]
+                                                                        )
           { matchStatus  = 401
           , matchHeaders = []
           }
       it "fails if select is not specified" $
         request methodPost "/limited_article_stars" [("Prefer", "return=representation")]
-          [json| {"article_id": 3, "user_id": 1} |] `shouldRespondWith` [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for relation limited_article_stars"}|]
+          [json| {"article_id": 3, "user_id": 1} |] `shouldRespondWith` (
+        if actualPgVersion >= pgVersion112 then
+        [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for view limited_article_stars"}|]
+           else
+        [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for relation limited_article_stars"}|]
+                                                                        )
           { matchStatus  = 401
           , matchHeaders = []
           }
 
-  describe "CSV insert" $ do
+    context "POST with ?columns parameter" $ do
+      it "ignores json keys not included in ?columns" $ do
+        request methodPost "/articles?columns=id,body" [("Prefer", "return=representation")]
+          [json| {"id": 200, "body": "xxx", "smth": "here", "other": "stuff", "fake_id": 13} |] `shouldRespondWith`
+          [json|[{"id": 200, "body": "xxx", "owner": "postgrest_test_anonymous"}]|]
+          { matchStatus  = 201
+          , matchHeaders = [] }
+        request methodPost "/articles?columns=id,body&select=id,body" [("Prefer", "return=representation")]
+          [json| [
+            {"id": 201, "body": "yyy", "smth": "here", "other": "stuff", "fake_id": 13},
+            {"id": 202, "body": "zzz", "garbage": "%%$&", "kkk": "jjj"},
+            {"id": 203, "body": "aaa", "hey": "ho"} ]|] `shouldRespondWith`
+          [json|[
+            {"id": 201, "body": "yyy"},
+            {"id": 202, "body": "zzz"},
+            {"id": 203, "body": "aaa"} ]|]
+          { matchStatus  = 201
+          , matchHeaders = [] }
 
+      -- TODO parse columns error message needs to be improved
+      it "disallows blank ?columns" $
+        post "/articles?columns="
+          [json|[
+            {"id": 204, "body": "yyy"},
+            {"id": 205, "body": "zzz"}]|]
+          `shouldRespondWith`
+          [json|  {"details":"unexpected end of input expecting field name (* or [a..z0..9_])","message":"\"failed to parse columns parameter ()\" (line 1, column 1)"} |]
+          { matchStatus  = 400
+          , matchHeaders = []
+          }
+
+      it "disallows array elements that are not json objects" $
+        post "/articles?columns=id,body"
+          [json|[
+            {"id": 204, "body": "yyy"},
+            333,
+            "asdf",
+            {"id": 205, "body": "zzz"}]|] `shouldRespondWith`
+          [json|{
+              "code": "22023",
+              "details": null,
+              "hint": null,
+              "message": "argument of json_populate_recordset must be an array of objects"}|]
+          { matchStatus  = 400
+          , matchHeaders = []
+          }
+
+  describe "CSV insert" $ do
     context "disparate csv types" $
       it "succeeds with multipart response" $ do
         pendingWith "Decide on what to do with CSV insert"
@@ -297,11 +384,13 @@ spec = do
           }
 
     context "with wrong number of columns" $
-      it "fails for too few" $ do
-        p <- request methodPost "/no_pk" [("Content-Type", "text/csv")] "a,b\nfoo,bar\nbaz"
-        liftIO $ do
-          simpleStatus p `shouldBe` badRequest400
-          isErrorFormat (simpleBody p) `shouldBe` True
+      it "fails for too few" $
+        request methodPost "/no_pk" [("Content-Type", "text/csv")] "a,b\nfoo,bar\nbaz"
+        `shouldRespondWith`
+        [json|{"message":"All lines must have same number of fields"}|]
+        { matchStatus  = 400
+        , matchHeaders = [matchContentTypeJson]
+        }
 
     context "with unicode values" $
       it "succeeds and returns usable location header" $ do
@@ -317,22 +406,20 @@ spec = do
         r <- get location
         liftIO $ simpleBody r `shouldBe` "["<>payload<>"]"
 
-
   describe "Patching record" $ do
-
     context "to unknown uri" $
-      it "gives a 404" $
+      it "indicates no table found by returning 404" $
         request methodPatch "/fake" []
           [json| { "real": false } |]
             `shouldRespondWith` 404
 
     context "on an empty table" $
-      it "indicates no records found to update" $
+      it "indicates no records found to update by returning 404" $
         request methodPatch "/empty_table" []
           [json| { "extra":20 } |]
           `shouldRespondWith` ""
-          { matchStatus  = 204,
-            matchHeaders = ["Content-Range" <:> "*/*"]
+          { matchStatus  = 404,
+            matchHeaders = []
           }
 
     context "in a nonempty table" $ do
@@ -359,9 +446,14 @@ spec = do
           [("Prefer", "return=representation")] [json| { "id":999999 } |]
           `shouldRespondWith` "[]"
           {
-            matchStatus  = 200,
-            matchHeaders = ["Content-Range" <:> "*/*"]
+            matchStatus  = 404,
+            matchHeaders = []
           }
+
+      it "gives a 404 when no rows updated" $
+        request methodPatch "/items?id=eq.99999999" []
+          [json| { "id": 42 } |]
+            `shouldRespondWith` 404
 
       it "returns updated object as array when return=rep" $
         request methodPatch "/items?id=eq.2"
@@ -390,25 +482,26 @@ spec = do
           [json| [{ a: "keepme", b: null }] |]
           { matchHeaders = [matchContentTypeJson] }
 
-      it "can set a json column to escaped value" $ do
-        _ <- post "/json" [json| { data: {"escaped":"bar"} } |]
-        request methodPatch "/json?data->>escaped=eq.bar"
-                     [("Prefer", "return=representation")]
-                     [json| { "data": { "escaped":" \"bar" } } |]
-          `shouldRespondWith` [json| [{ "data": { "escaped":" \"bar" } }] |]
-          { matchStatus  = 200
-          , matchHeaders = []
-          }
+      context "filtering by a computed column" $ do
+        it "is successful" $
+          request methodPatch
+            "/items?is_first=eq.true"
+            [("Prefer", "return=representation")]
+            [json| { id: 100 } |]
+            `shouldRespondWith` [json| [{ id: 100 }] |]
+            { matchStatus  = 200,
+              matchHeaders = [matchContentTypeJson, "Content-Range" <:> "0-0/*"]
+            }
 
-      it "can update based on a computed column" $
-        request methodPatch
-          "/items?always_true=eq.false"
-          [("Prefer", "return=representation")]
-          [json| { id: 100 } |]
-          `shouldRespondWith` "[]"
-          { matchStatus  = 200,
-            matchHeaders = ["Content-Range" <:> "*/*"]
-          }
+        it "indicates no records updated by returning 404" $
+          request methodPatch
+            "/items?always_true=eq.false"
+            [("Prefer", "return=representation")]
+            [json| { id: 100 } |]
+            `shouldRespondWith` "[]"
+            { matchStatus  = 404,
+              matchHeaders = []
+            }
 
       it "can provide a representation" $ do
         _ <- post "/items"
@@ -437,21 +530,21 @@ spec = do
             matchHeaders = ["Content-Range" <:> "*/*"]
           }
 
-        get "/items" `shouldRespondWith`
-          [json|[{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{id:16},{"id":2},{"id":1}]|]
-          { matchHeaders = [matchContentTypeJson] }
+        request methodPatch "/items" [] [json| [{}] |]
+          `shouldRespondWith` ""
+          {
+            matchStatus  = 204,
+            matchHeaders = ["Content-Range" <:> "*/*"]
+          }
 
-      it "makes no updates and and returns 200, when patching with an empty json object and return=rep" $ do
+      it "makes no updates and and returns 200, when patching with an empty json object and return=rep" $
         request methodPatch "/items" [("Prefer", "return=representation")] [json| {} |]
           `shouldRespondWith` "[]"
           {
             matchStatus  = 200,
             matchHeaders = ["Content-Range" <:> "*/*"]
           }
-        get "/items" `shouldRespondWith`
-          [json| [{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15},{id:16},{"id":2},{"id":1}] |]
-          { matchHeaders = [matchContentTypeJson] }
-  
+
     context "with unicode values" $
       it "succeeds and returns values intact" $ do
         void $ request methodPost "/no_pk" []
@@ -462,6 +555,18 @@ spec = do
         liftIO $ do
           simpleBody p `shouldBe` "["<>payload<>"]"
           simpleStatus p `shouldBe` ok200
+
+    context "PATCH with ?columns parameter" $ do
+      it "ignores json keys not included in ?columns" $
+        request methodPatch "/articles?id=eq.200&columns=body" [("Prefer", "return=representation")]
+          [json| {"body": "Some real content", "smth": "here", "other": "stuff", "fake_id": 13} |] `shouldRespondWith`
+          [json|[{"id": 200, "body": "Some real content", "owner": "postgrest_test_anonymous"}]|]
+          { matchStatus  = 200
+          , matchHeaders = [] }
+
+      it "ignores json keys and gives 404 if no record updated" $
+        request methodPatch "/articles?id=eq.2001&columns=body" [("Prefer", "return=representation")]
+          [json| {"body": "Some real content", "smth": "here", "other": "stuff", "fake_id": 13} |] `shouldRespondWith` 404
 
   describe "Row level permission" $
     it "set user_id when inserting rows" $ do

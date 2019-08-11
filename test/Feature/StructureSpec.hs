@@ -1,21 +1,21 @@
 module Feature.StructureSpec where
 
-import Test.Hspec hiding (pendingWith)
-import Test.Hspec.Wai
-import Network.HTTP.Types
-
-import PostgREST.Config (docsVersion)
-import Control.Lens ((^?))
+import Control.Lens     ((^?))
 import Data.Aeson.Types (Value (..))
+import Network.Wai      (Application)
+import Network.Wai.Test (SResponse (..))
+
 import Data.Aeson.Lens
 import Data.Aeson.QQ
+import Network.HTTP.Types
+import Test.Hspec         hiding (pendingWith)
+import Test.Hspec.Wai
 
+
+
+import PostgREST.Config (docsVersion)
+import Protolude        hiding (get)
 import SpecHelper
-
-import Network.Wai (Application)
-import Network.Wai.Test (SResponse(..))
-
-import Protolude hiding (get)
 
 spec :: SpecWith Application
 spec = do
@@ -29,12 +29,12 @@ spec = do
               (acceptHdrs "application/openapi+json") ""
         `shouldRespondWith` 415
 
-    it "includes postgrest.com current version api docs" $ do
+    it "includes postgrest.org current version api docs" $ do
       r <- simpleBody <$> get "/"
 
       let docsUrl = r ^? key "externalDocs" . key "url"
 
-      liftIO $ docsUrl `shouldBe` Just (String ("https://postgrest.com/en/" <> docsVersion <> "/api.html"))
+      liftIO $ docsUrl `shouldBe` Just (String ("https://postgrest.org/en/" <> docsVersion <> "/api.html"))
 
     describe "table" $ do
 
@@ -45,6 +45,7 @@ spec = do
             childGetSummary = r ^? method "get" . key "summary"
             childGetDescription = r ^? method "get" . key "description"
             getParameters = r ^? method "get" . key "parameters"
+            postParameters = r ^? method "post" . key "parameters"
             postResponse = r ^? method "post" . key "responses" . key "201" . key "description"
             patchResponse = r ^? method "patch" . key "responses" . key "204" . key "description"
             deleteResponse = r ^? method "delete" . key "responses" . key "204" . key "description"
@@ -79,11 +80,41 @@ spec = do
               ]
             |]
 
+          postParameters `shouldBe` Just
+            [aesonQQ|
+              [
+                { "$ref": "#/parameters/body.child_entities" },
+                { "$ref": "#/parameters/select" },
+                { "$ref": "#/parameters/preferReturn" }
+              ]
+            |]
+
           postResponse `shouldBe` Just "Created"
 
           patchResponse `shouldBe` Just "No Content"
 
           deleteResponse `shouldBe` Just "No Content"
+
+      it "includes an array type for GET responses" $ do
+        r <- simpleBody <$> get "/"
+
+        let childGetSchema = r ^? key "paths"
+              . key "/child_entities"
+              . key "get"
+              . key "responses"
+              . key "200"
+              . key "schema"
+
+        liftIO $
+          childGetSchema `shouldBe` Just
+            [aesonQQ|
+              {
+                "items": {
+                  "$ref": "#/definitions/child_entities"
+                },
+                "type": "array"
+              }
+            |]
 
       it "includes definitions to tables" $ do
         r <- simpleBody <$> get "/"
@@ -104,7 +135,7 @@ spec = do
                     "type": "integer"
                   },
                   "name": {
-                    "description": "child_entities name comment",
+                    "description": "child_entities name comment. Can be longer than sixty-three characters long",
                     "format": "text",
                     "type": "string"
                   },
@@ -113,7 +144,10 @@ spec = do
                     "format": "integer",
                     "type": "integer"
                   }
-                }
+                },
+                "required": [
+                  "id"
+                ]
               }
             |]
 
@@ -131,15 +165,238 @@ spec = do
                       . nth 0
         liftIO $ tableTag `shouldBe` Just [aesonQQ|"authors_only"|]
 
-    describe "RPC" $ do
+    describe "Foreign table" $
 
-      it "includes body schema for arguments" $ do
+      it "includes foreign table properties" $ do
         r <- simpleBody <$> get "/"
-        let args = r ^? key "paths" . key "/rpc/varied_arguments"
-                      . key "post"  . key "parameters"
-                      . nth 0       . key "schema"
+
+        let method s = key "paths" . key "/projects_dump" . key s
+            getSummary = r ^? method "get" . key "summary"
+            getDescription = r ^? method "get" . key "description"
+            getParameters = r ^? method "get" . key "parameters"
+
+        liftIO $ do
+
+          getSummary `shouldBe` Just "A temporary projects dump"
+
+          getDescription `shouldBe` Just "Just a test for foreign tables"
+
+          getParameters `shouldBe` Just
+            [aesonQQ|
+              [
+                { "$ref": "#/parameters/rowFilter.projects_dump.id" },
+                { "$ref": "#/parameters/rowFilter.projects_dump.name" },
+                { "$ref": "#/parameters/rowFilter.projects_dump.client_id" },
+                { "$ref": "#/parameters/select" },
+                { "$ref": "#/parameters/order" },
+                { "$ref": "#/parameters/range" },
+                { "$ref": "#/parameters/rangeUnit" },
+                { "$ref": "#/parameters/offset" },
+                { "$ref": "#/parameters/limit" },
+                { "$ref": "#/parameters/preferCount" }
+              ]
+            |]
+
+    describe "Materialized view" $
+
+      it "includes materialized view properties" $ do
+        r <- simpleBody <$> get "/"
+
+        let method s = key "paths" . key "/materialized_projects" . key s
+            summary = r ^? method "get" . key "summary"
+            description = r ^? method "get" . key "description"
+            parameters = r ^? method "get" . key "parameters"
+
+        liftIO $ do
+
+          summary `shouldBe` Just "A materialized view for projects"
+
+          description `shouldBe` Just "Just a test for materialized views"
+
+          parameters `shouldBe` Just
+            [aesonQQ|
+              [
+                { "$ref": "#/parameters/rowFilter.materialized_projects.id" },
+                { "$ref": "#/parameters/rowFilter.materialized_projects.name" },
+                { "$ref": "#/parameters/rowFilter.materialized_projects.client_id" },
+                { "$ref": "#/parameters/select" },
+                { "$ref": "#/parameters/order" },
+                { "$ref": "#/parameters/range" },
+                { "$ref": "#/parameters/rangeUnit" },
+                { "$ref": "#/parameters/offset" },
+                { "$ref": "#/parameters/limit" },
+                { "$ref": "#/parameters/preferCount" }
+              ]
+            |]
+
+    describe "PostgreSQL to Swagger Type Mapping" $ do
+
+      it "character varying to string" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_character_varying"
 
         liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "character varying",
+                "type": "string"
+              }
+            |]
+      it "character(1) to string" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_character"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "maxLength": 1,
+                "format": "character",
+                "type": "string"
+              }
+            |]
+
+      it "text to string" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_text"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "text",
+                "type": "string"
+              }
+            |]
+
+      it "boolean to boolean" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_boolean"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "boolean",
+                "type": "boolean"
+              }
+            |]
+
+      it "smallint to integer" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_smallint"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "smallint",
+                "type": "integer"
+              }
+            |]
+
+      it "integer to integer" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_integer"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "integer",
+                "type": "integer"
+              }
+            |]
+
+      it "bigint to integer" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_bigint"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "bigint",
+                "type": "integer"
+              }
+            |]
+
+      it "numeric to number" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_numeric"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "numeric",
+                "type": "number"
+              }
+            |]
+
+      it "real to number" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_real"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "real",
+                "type": "number"
+              }
+            |]
+
+      it "double_precision to number" $ do
+        r <- simpleBody <$> get "/"
+
+        let types = r ^? key "definitions" . key "openapi_types" . key "properties" . key "a_double_precision"
+
+        liftIO $
+
+          types `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "double precision",
+                "type": "number"
+              }
+            |]
+
+    describe "RPC" $ do
+
+      it "includes function summary/description and body schema for arguments" $ do
+        r <- simpleBody <$> get "/"
+
+        let method s = key "paths" . key "/rpc/varied_arguments" . key s
+            args = r ^? method "post" . key "parameters" . nth 0 . key "schema"
+            summary = r ^? method "post" . key "summary"
+            description = r ^? method "post" . key "description"
+
+        liftIO $ do
+
+          summary `shouldBe` Just "An RPC function"
+
+          description `shouldBe` Just "Just a test for RPC function arguments"
+
           args `shouldBe` Just
             [aesonQQ|
               {
@@ -154,7 +411,7 @@ spec = do
                 "properties": {
                   "double": {
                     "format": "double precision",
-                    "type": "string"
+                    "type": "number"
                   },
                   "varchar": {
                     "format": "character varying",
@@ -179,9 +436,18 @@ spec = do
                   "integer": {
                     "format": "integer",
                     "type": "integer"
+                  },
+                  "json": {
+                    "format": "json",
+                    "type": "string"
+                  },
+                  "jsonb": {
+                    "format": "jsonb",
+                    "type": "string"
                   }
                 },
-                "type": "object"
+                "type": "object",
+                "description": "An RPC function\n\nJust a test for RPC function arguments"
               }
             |]
 

@@ -1,40 +1,51 @@
 module Main where
 
+import qualified Hasql.Pool                 as P
+import qualified Hasql.Transaction.Sessions as HT
+
+import Control.AutoUpdate (defaultUpdateSettings, mkAutoUpdate,
+                           updateAction)
+import Data.Function      (id)
+import Data.Time.Clock    (getCurrentTime)
+
+import Data.IORef
 import Test.Hspec
+
+import PostgREST.App         (postgrest)
+import PostgREST.DbStructure (getDbStructure, getPgVersion)
+import PostgREST.Types       (DbStructure (..), pgVersion95,
+                              pgVersion96)
+import Protolude
 import SpecHelper
 
-import qualified Hasql.Pool as P
-
-import PostgREST.App (postgrest)
-import PostgREST.Config (pgVersion95, pgVersion96, configSettings)
-import PostgREST.DbStructure (getDbStructure, getPgVersion, fillSessionWithSettings)
-import PostgREST.Types (DbStructure(..))
-import Data.Function (id)
-import Data.IORef
-
-import qualified Feature.AuthSpec
+import qualified Feature.AndOrParamsSpec
 import qualified Feature.AsymmetricJwtSpec
-import qualified Feature.BinaryJwtSecretSpec
 import qualified Feature.AudienceJwtSecretSpec
+import qualified Feature.AuthSpec
+import qualified Feature.BinaryJwtSecretSpec
 import qualified Feature.ConcurrentSpec
 import qualified Feature.CorsSpec
 import qualified Feature.DeleteSpec
+import qualified Feature.ExtraSearchPathSpec
+import qualified Feature.HtmlRawOutputSpec
 import qualified Feature.InsertSpec
+import qualified Feature.JsonOperatorSpec
 import qualified Feature.NoJwtSpec
+import qualified Feature.NonexistentSchemaSpec
+import qualified Feature.PgVersion95Spec
+import qualified Feature.PgVersion96Spec
+import qualified Feature.ProxySpec
 import qualified Feature.QueryLimitedSpec
 import qualified Feature.QuerySpec
 import qualified Feature.RangeSpec
-import qualified Feature.StructureSpec
-import qualified Feature.SingularSpec
-import qualified Feature.UnicodeSpec
-import qualified Feature.ProxySpec
-import qualified Feature.AndOrParamsSpec
+import qualified Feature.RawOutputTypesSpec
+import qualified Feature.RootSpec
 import qualified Feature.RpcSpec
-import qualified Feature.NonexistentSchemaSpec
-import qualified Feature.PgVersion96Spec
+import qualified Feature.SingularSpec
+import qualified Feature.StructureSpec
+import qualified Feature.UnicodeSpec
 import qualified Feature.UpsertSpec
 
-import Protolude
 
 main :: IO ()
 main = do
@@ -43,47 +54,61 @@ main = do
 
   pool <- P.acquire (3, 10, toS testDbConn)
 
-  result <- P.use pool $ getDbStructure "test" =<< getPgVersion
+  result <- P.use pool $ do
+    ver <- getPgVersion
+    HT.transaction HT.ReadCommitted HT.Read $ getDbStructure "test" ver
 
-  dbStructure <- pure $ either (panic.show) id result
+  let dbStructure = either (panic.show) id result
+
+  getTime <- mkAutoUpdate defaultUpdateSettings { updateAction = getCurrentTime }
 
   refDbStructure <- newIORef $ Just dbStructure
 
-  let withApp              = return $ postgrest (testCfg testDbConn)            refDbStructure pool $ pure ()
-      ltdApp               = return $ postgrest (testLtdRowsCfg testDbConn)     refDbStructure pool $ pure ()
-      unicodeApp           = return $ postgrest (testUnicodeCfg testDbConn)     refDbStructure pool $ pure ()
-      proxyApp             = return $ postgrest (testProxyCfg testDbConn)       refDbStructure pool $ pure ()
-      noJwtApp             = return $ postgrest (testCfgNoJWT testDbConn)       refDbStructure pool $ pure ()
-      binaryJwtApp         = return $ postgrest (testCfgBinaryJWT testDbConn)   refDbStructure pool $ pure ()
-      audJwtApp            = return $ postgrest (testCfgAudienceJWT testDbConn) refDbStructure pool $ pure ()
-      asymJwkApp           = return $ postgrest (testCfgAsymJWK testDbConn)     refDbStructure pool $ pure ()
-      nonexistentSchemaApp = return $ postgrest (testNonexistentSchemaCfg testDbConn)   refDbStructure pool $ pure ()
+  let withApp              = return $ postgrest (testCfg testDbConn)                  refDbStructure pool getTime $ pure ()
+      ltdApp               = return $ postgrest (testLtdRowsCfg testDbConn)           refDbStructure pool getTime $ pure ()
+      unicodeApp           = return $ postgrest (testUnicodeCfg testDbConn)           refDbStructure pool getTime $ pure ()
+      proxyApp             = return $ postgrest (testProxyCfg testDbConn)             refDbStructure pool getTime $ pure ()
+      noJwtApp             = return $ postgrest (testCfgNoJWT testDbConn)             refDbStructure pool getTime $ pure ()
+      binaryJwtApp         = return $ postgrest (testCfgBinaryJWT testDbConn)         refDbStructure pool getTime $ pure ()
+      audJwtApp            = return $ postgrest (testCfgAudienceJWT testDbConn)       refDbStructure pool getTime $ pure ()
+      asymJwkApp           = return $ postgrest (testCfgAsymJWK testDbConn)           refDbStructure pool getTime $ pure ()
+      asymJwkSetApp        = return $ postgrest (testCfgAsymJWKSet testDbConn)        refDbStructure pool getTime $ pure ()
+      nonexistentSchemaApp = return $ postgrest (testNonexistentSchemaCfg testDbConn) refDbStructure pool getTime $ pure ()
+      extraSearchPathApp   = return $ postgrest (testCfgExtraSearchPath testDbConn)   refDbStructure pool getTime $ pure ()
+      rootSpecApp          = return $ postgrest (testCfgRootSpec testDbConn)          refDbStructure pool getTime $ pure ()
+      htmlRawOutputApp     = return $ postgrest (testCfgHtmlRawOutput testDbConn)     refDbStructure pool getTime $ pure ()
 
   let reset :: IO ()
-      reset = P.use pool (fillSessionWithSettings (configSettings $ testCfg testDbConn)) >> resetDb testDbConn
+      reset = resetDb testDbConn
 
       actualPgVersion = pgVersion dbStructure
       extraSpecs =
         [("Feature.UpsertSpec", Feature.UpsertSpec.spec) | actualPgVersion >= pgVersion95] ++
+        [("Feature.PgVersion95Spec", Feature.PgVersion95Spec.spec) | actualPgVersion >= pgVersion95] ++
         [("Feature.PgVersion96Spec", Feature.PgVersion96Spec.spec) | actualPgVersion >= pgVersion96]
 
       specs = uncurry describe <$> [
-          ("Feature.AuthSpec"               , Feature.AuthSpec.spec)
+          ("Feature.AuthSpec"               , Feature.AuthSpec.spec actualPgVersion)
+        , ("Feature.RawOutputTypesSpec"     , Feature.RawOutputTypesSpec.spec)
         , ("Feature.ConcurrentSpec"         , Feature.ConcurrentSpec.spec)
         , ("Feature.CorsSpec"               , Feature.CorsSpec.spec)
         , ("Feature.DeleteSpec"             , Feature.DeleteSpec.spec)
-        , ("Feature.InsertSpec"             , Feature.InsertSpec.spec)
-        , ("Feature.QuerySpec"              , Feature.QuerySpec.spec)
-        , ("Feature.RpcSpec"                , Feature.RpcSpec.spec)
+        , ("Feature.InsertSpec"             , Feature.InsertSpec.spec actualPgVersion)
+        , ("Feature.JsonOperatorSpec"       , Feature.JsonOperatorSpec.spec actualPgVersion)
+        , ("Feature.QuerySpec"              , Feature.QuerySpec.spec actualPgVersion)
+        , ("Feature.RpcSpec"                , Feature.RpcSpec.spec actualPgVersion)
         , ("Feature.RangeSpec"              , Feature.RangeSpec.spec)
         , ("Feature.SingularSpec"           , Feature.SingularSpec.spec)
         , ("Feature.StructureSpec"          , Feature.StructureSpec.spec)
-        , ("Feature.AndOrParamsSpec"        , Feature.AndOrParamsSpec.spec)
-        , ("Feature.NonexistentSchemaSpec"  , Feature.NonexistentSchemaSpec.spec)
+        , ("Feature.AndOrParamsSpec"        , Feature.AndOrParamsSpec.spec actualPgVersion)
         ] ++ extraSpecs
 
   hspec $ do
     mapM_ (beforeAll_ reset . before withApp) specs
+
+    -- this test runs with a raw-output-media-types set to text/html
+    beforeAll_ reset . before htmlRawOutputApp $
+      describe "Feature.HtmlRawOutputSpec" Feature.HtmlRawOutputSpec.spec
 
     -- this test runs with a different server flag
     beforeAll_ reset . before ltdApp $
@@ -113,6 +138,19 @@ main = do
     beforeAll_ reset . before asymJwkApp $
       describe "Feature.AsymmetricJwtSpec" Feature.AsymmetricJwtSpec.spec
 
+    -- this test runs with asymmetric JWKSet
+    beforeAll_ reset . before asymJwkSetApp $
+      describe "Feature.AsymmetricJwtSpec" Feature.AsymmetricJwtSpec.spec
+
     -- this test runs with a nonexistent db-schema
     beforeAll_ reset . before nonexistentSchemaApp $
       describe "Feature.NonexistentSchemaSpec" Feature.NonexistentSchemaSpec.spec
+
+    -- this test runs with an extra search path
+    beforeAll_ reset . before extraSearchPathApp $
+      describe "Feature.ExtraSearchPathSpec" Feature.ExtraSearchPathSpec.spec
+
+    -- this test runs with a root spec function override
+    when (actualPgVersion >= pgVersion96) $
+      beforeAll_ reset . before rootSpecApp $
+        describe "Feature.RootSpec" Feature.RootSpec.spec

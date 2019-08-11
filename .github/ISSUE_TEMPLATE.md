@@ -1,18 +1,11 @@
 ### Environment
 
-* Version of postgrest:
+* PostgreSQL version: (if using docker, specify the image)
+* PostgREST version: (if using docker, specify the image)
 * Operating system:
-* Running in docker:
-  * [ ] yes
-  * [ ] no
 
 ### Description of issue
 
-(Expected behavior vs actual behavior.)
+(Expected behavior vs actual behavior)
 
-### Support level
-
-In addition to free community support, are you interested in priority consulting time from [begriffs](https://begriffs.com/)?
-
-* [ ] yes
-* [ ] no
+(Steps to reproduce: Include a minimal SQL definition plus how you make the request to PostgREST and the response body)

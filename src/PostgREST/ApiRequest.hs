@@ -1,43 +1,53 @@
-{-# LANGUAGE LambdaCase #-}
 {-|
 Module      : PostgREST.ApiRequest
 Description : PostgREST functions to translate HTTP request to a domain type called ApiRequest.
 -}
-module PostgREST.ApiRequest ( ApiRequest(..)
-                            , ContentType(..)
-                            , Action(..)
-                            , Target(..)
-                            , PreferRepresentation (..)
-                            , mutuallyAgreeable
-                            , userApiRequest
-                            ) where
+{-# LANGUAGE LambdaCase #-}
 
-import           Protolude
-import qualified Data.Aeson                as JSON
-import           Data.Aeson.Types          (emptyObject, emptyArray)
-import qualified Data.ByteString           as BS
-import qualified Data.ByteString.Internal  as BS (c2w)
-import qualified Data.ByteString.Lazy      as BL
-import qualified Data.Csv                  as CSV
-import qualified Data.List                 as L
-import           Data.List                 (lookup, last, partition)
-import qualified Data.HashMap.Strict       as M
-import qualified Data.Set                  as S
-import           Data.Maybe                (fromJust)
-import           Control.Arrow             ((***))
-import qualified Data.Text                 as T
-import qualified Data.Vector               as V
-import           Network.HTTP.Base         (urlEncodeVars)
-import           Network.HTTP.Types.Header (hAuthorization, hCookie)
-import           Network.HTTP.Types.URI    (parseSimpleQuery)
-import           Network.Wai               (Request (..))
-import           Network.Wai.Parse         (parseHttpAccept)
-import           PostgREST.RangeQuery      (NonnegRange, rangeRequested, restrictRange, rangeGeq, allRange, rangeLimit, rangeOffset)
-import           Data.Ranged.Boundaries
-import           PostgREST.Types
-import           Data.Ranged.Ranges        (Range(..), rangeIntersection, emptyRange)
-import qualified Data.CaseInsensitive      as CI
-import           Web.Cookie                (parseCookiesText)
+module PostgREST.ApiRequest (
+  ApiRequest(..)
+, ContentType(..)
+, Action(..)
+, Target(..)
+, PreferRepresentation (..)
+, mutuallyAgreeable
+, userApiRequest
+) where
+
+import qualified Data.Aeson           as JSON
+import qualified Data.ByteString      as BS
+import qualified Data.ByteString.Lazy as BL
+import qualified Data.CaseInsensitive as CI
+import qualified Data.Csv             as CSV
+import qualified Data.HashMap.Strict  as M
+import qualified Data.List            as L
+import qualified Data.Set             as S
+import qualified Data.Text            as T
+import qualified Data.Vector          as V
+
+import Control.Arrow             ((***))
+import Data.Aeson.Types          (emptyArray, emptyObject)
+import Data.List                 (last, lookup, partition)
+import Data.Maybe                (fromJust)
+import Data.Ranged.Ranges        (Range (..), emptyRange,
+                                  rangeIntersection)
+import Network.HTTP.Base         (urlEncodeVars)
+import Network.HTTP.Types.Header (hAuthorization, hCookie)
+import Network.HTTP.Types.URI    (parseQueryReplacePlus,
+                                  parseSimpleQuery)
+import Network.Wai               (Request (..))
+import Network.Wai.Parse         (parseHttpAccept)
+import Web.Cookie                (parseCookiesText)
+
+
+import Data.Ranged.Boundaries
+
+import PostgREST.Error      (ApiRequestError (..))
+import PostgREST.RangeQuery (NonnegRange, allRange, rangeGeq,
+                             rangeLimit, rangeOffset, rangeRequested,
+                             restrictRange)
+import PostgREST.Types
+import Protolude
 
 type RequestBody = BL.ByteString
 
@@ -49,8 +59,8 @@ data Action = ActionCreate  | ActionRead
             deriving Eq
 -- | The target db object of a user action
 data Target = TargetIdent QualifiedIdentifier
-            | TargetProc  QualifiedIdentifier
-            | TargetRoot
+            | TargetProc{tpQi :: QualifiedIdentifier, tpIsRootSpec :: Bool}
+            | TargetDefaultSpec -- The default spec offered at root "/"
             | TargetUnknown [Text]
             deriving Eq
 -- | How to return the inserted data
@@ -65,53 +75,54 @@ data PreferRepresentation = Full | HeadersOnly | None deriving Eq
 -}
 data ApiRequest = ApiRequest {
   -- | Similar but not identical to HTTP verb, e.g. Create/Invoke both POST
-    iAction :: Action
+    iAction                      :: Action
   -- | Requested range of rows within response
-  , iRange  :: M.HashMap ByteString NonnegRange
+  , iRange                       :: M.HashMap ByteString NonnegRange
   -- | The target, be it calling a proc or accessing a table
-  , iTarget :: Target
+  , iTarget                      :: Target
   -- | Content types the client will accept, [CTAny] if no Accept header
-  , iAccepts :: [ContentType]
+  , iAccepts                     :: [ContentType]
   -- | Data sent by client and used for mutation actions
-  , iPayload :: Maybe PayloadJSON
+  , iPayload                     :: Maybe PayloadJSON
   -- | If client wants created items echoed back
-  , iPreferRepresentation :: PreferRepresentation
+  , iPreferRepresentation        :: PreferRepresentation
   -- | Pass all parameters as a single json object to a stored procedure
   , iPreferSingleObjectParameter :: Bool
   -- | Whether the client wants a result count (slower)
-  , iPreferCount :: Bool
+  , iPreferCount                 :: Bool
   -- | Whether the client wants to UPSERT or ignore records on PK conflict
-  , iPreferResolution :: Maybe PreferResolution
+  , iPreferResolution            :: Maybe PreferResolution
   -- | Filters on the result ("id", "eq.10")
-  , iFilters :: [(Text, Text)]
+  , iFilters                     :: [(Text, Text)]
   -- | &and and &or parameters used for complex boolean logic
-  , iLogic :: [(Text, Text)]
+  , iLogic                       :: [(Text, Text)]
   -- | &select parameter used to shape the response
-  , iSelect :: Text
+  , iSelect                      :: Text
+  -- | &columns parameter used to shape the payload
+  , iColumns                     :: Maybe Text
   -- | &order parameters for each level
-  , iOrder :: [(Text, Text)]
+  , iOrder                       :: [(Text, Text)]
   -- | Alphabetized (canonical) request query string for response URLs
-  , iCanonicalQS :: ByteString
+  , iCanonicalQS                 :: ByteString
   -- | JSON Web Token
-  , iJWT :: Text
+  , iJWT                         :: Text
   -- | HTTP request headers
-  , iHeaders :: [(Text, Text)]
+  , iHeaders                     :: [(Text, Text)]
   -- | Request Cookies
-  , iCookies :: [(Text, Text)]
+  , iCookies                     :: [(Text, Text)]
   }
 
 -- | Examines HTTP request and translates it into user intent.
-userApiRequest :: Schema -> Request -> RequestBody -> Either ApiRequestError ApiRequest
-userApiRequest schema req reqBody
+userApiRequest :: Schema -> Maybe QualifiedIdentifier -> Request -> RequestBody -> Either ApiRequestError ApiRequest
+userApiRequest schema rootSpec req reqBody
   | isTargetingProc && method `notElem` ["GET", "POST"] = Left ActionInappropriate
   | topLevelRange == emptyRange = Left InvalidRange
-  | shouldParsePayload && isLeft payload = either (Left . InvalidBody . toS) undefined payload
+  | shouldParsePayload && isLeft payload = either (Left . InvalidBody . toS) witness payload
   | otherwise = Right ApiRequest {
       iAction = action
       , iTarget = target
       , iRange = ranges
-      , iAccepts = fromMaybe [CTAny] $
-        map decodeContentType . parseHttpAccept <$> lookupHeader "accept"
+      , iAccepts = maybe [CTAny] (map decodeContentType . parseHttpAccept) $ lookupHeader "accept"
       , iPayload = relevantPayload
       , iPreferRepresentation = representation
       , iPreferSingleObjectParameter = singleObject
@@ -121,51 +132,64 @@ userApiRequest schema req reqBody
                             else Nothing
       , iFilters = filters
       , iLogic = [(toS k, toS $ fromJust v) | (k,v) <- qParams, isJust v, endingIn ["and", "or"] k ]
-      , iSelect = toS $ fromMaybe "*" $ fromMaybe (Just "*") $ lookup "select" qParams
+      , iSelect = toS $ fromMaybe "*" $ join $ lookup "select" qParams
+      , iColumns = columns
       , iOrder = [(toS k, toS $ fromJust v) | (k,v) <- qParams, isJust v, endingIn ["order"] k ]
       , iCanonicalQS = toS $ urlEncodeVars
-        . L.sortBy (comparing fst)
-        . map (join (***) toS)
-        . parseSimpleQuery
-        $ rawQueryString req
+        . L.sortOn fst
+        . map (join (***) toS . second (fromMaybe BS.empty))
+        $ queryStringWPlus
       , iJWT = tokenStr
       , iHeaders = [ (toS $ CI.foldedCase k, toS v) | (k,v) <- hdrs, k /= hAuthorization, k /= hCookie]
-      , iCookies = fromMaybe [] $ parseCookiesText <$> lookupHeader "Cookie"
+      , iCookies = maybe [] parseCookiesText $ lookupHeader "Cookie"
       }
  where
+  -- queryString with '+' not converted to ' '
+  queryStringWPlus = parseQueryReplacePlus False $ rawQueryString req
   -- rpcQParams = Rpc query params e.g. /rpc/name?param1=val1, similar to filter but with no operator(eq, lt..)
   (filters, rpcQParams) =
     case action of
       ActionInvoke{isReadOnly=True} -> partition (liftM2 (||) (isEmbedPath . fst) (hasOperator . snd)) flts
       _ -> (flts, [])
-  flts = [ (toS k, toS $ fromJust v) | (k,v) <- qParams, isJust v, k /= "select", not (endingIn ["order", "limit", "offset", "and", "or"] k) ]
+  flts =
+    [ (toS k, toS $ fromJust v) |
+      (k,v) <- qParams, isJust v,
+      k `notElem` ["select", "columns"],
+      not (endingIn ["order", "limit", "offset", "and", "or"] k) ]
   hasOperator val = any (`T.isPrefixOf` val) $
                       ((<> ".") <$> "not":M.keys operators) ++
                       ((<> "(") <$> M.keys ftsOperators)
   isEmbedPath = T.isInfixOf "."
-  isTargetingProc = fromMaybe False $ (== "rpc") <$> listToMaybe path
+  isTargetingProc = case target of
+    TargetProc _ _ -> True
+    _              -> False
+  contentType = decodeContentType . fromMaybe "application/json" $ lookupHeader "content-type"
+  columns | action `elem` [ActionCreate, ActionUpdate, ActionInvoke{isReadOnly=False}] = toS <$> join (lookup "columns" qParams)
+          | otherwise = Nothing
   payload =
-    case (decodeContentType . fromMaybe "application/json" $ lookupHeader "content-type", action) of
+    case (contentType, action) of
       (_, ActionInvoke{isReadOnly=True}) ->
-        Right $ PayloadJSON (JSON.encode $ M.fromList $ second JSON.toJSON <$> rpcQParams) PJObject (S.fromList $ fst <$> rpcQParams)
+        Right $ ProcessedJSON (JSON.encode $ M.fromList $ second JSON.toJSON <$> rpcQParams) PJObject (S.fromList $ fst <$> rpcQParams)
       (CTApplicationJSON, _) ->
-        note "All object keys must match" . payloadAttributes reqBody
-          =<< if BL.null reqBody && isTargetingProc
-               then Right emptyObject
-               else JSON.eitherDecode reqBody
+        if isJust columns
+          then Right $ RawJSON reqBody
+          else note "All object keys must match" . payloadAttributes reqBody
+                 =<< if BL.null reqBody && isTargetingProc
+                       then Right emptyObject
+                       else JSON.eitherDecode reqBody
       (CTTextCSV, _) -> do
         json <- csvToJson <$> CSV.decodeByName reqBody
         note "All lines must have same number of fields" $ payloadAttributes (JSON.encode json) json
       (CTOther "application/x-www-form-urlencoded", _) ->
         let json = M.fromList . map (toS *** JSON.String . toS) . parseSimpleQuery $ toS reqBody
             keys = S.fromList $ M.keys json in
-        Right $ PayloadJSON (JSON.encode json) PJObject keys
+        Right $ ProcessedJSON (JSON.encode json) PJObject keys
       (ct, _) ->
         Left $ toS $ "Content-Type not acceptable: " <> toMime ct
   topLevelRange = fromMaybe allRange $ M.lookup "limit" ranges
   action =
     case method of
-      "GET"      | target == TargetRoot -> ActionInspect
+      "GET"      | target == TargetDefaultSpec -> ActionInspect
                  | isTargetingProc -> ActionInvoke{isReadOnly=True}
                  | otherwise -> ActionRead
 
@@ -178,19 +202,20 @@ userApiRequest schema req reqBody
       "OPTIONS" -> ActionInfo
       _         -> ActionInspect
   target = case path of
-              []            -> TargetRoot
-              [table]       -> TargetIdent
-                              $ QualifiedIdentifier schema table
-              ["rpc", proc] -> TargetProc
-                              $ QualifiedIdentifier schema proc
-              other         -> TargetUnknown other
+    []            -> case rootSpec of
+                       Just rsQi -> TargetProc rsQi True
+                       Nothing   -> TargetDefaultSpec
+    [table]       -> TargetIdent $ QualifiedIdentifier schema table
+    ["rpc", proc] -> TargetProc (QualifiedIdentifier schema proc) False
+    other         -> TargetUnknown other
+
   shouldParsePayload = action `elem` [ActionCreate, ActionUpdate, ActionSingleUpsert, ActionInvoke{isReadOnly=False}, ActionInvoke{isReadOnly=True}]
   relevantPayload | shouldParsePayload = rightToMaybe payload
                   | otherwise = Nothing
   path            = pathInfo req
   method          = requestMethod req
   hdrs            = requestHeaders req
-  qParams         = [(toS k, v)|(k,v) <- queryString req]
+  qParams         = [(toS k, v)|(k,v) <- queryStringWPlus]
   lookupHeader    = flip lookup hdrs
   hasPrefer :: Text -> Bool
   hasPrefer val   = any (\(h,v) -> h == "Prefer" && val `elem` split v) hdrs
@@ -215,7 +240,7 @@ userApiRequest schema req reqBody
   limitParams :: M.HashMap ByteString NonnegRange
   limitParams  = M.fromList [(toS (replaceLast "limit" k), restrictRange (readMaybe =<< (toS <$> v)) allRange) | (k,v) <- qParams, isJust v, endingIn ["limit"] k]
   offsetParams :: M.HashMap ByteString NonnegRange
-  offsetParams = M.fromList [(toS (replaceLast "limit" k), fromMaybe allRange (rangeGeq <$> (readMaybe =<< (toS <$> v)))) | (k,v) <- qParams, isJust v, endingIn ["offset"] k]
+  offsetParams = M.fromList [(toS (replaceLast "limit" k), maybe allRange rangeGeq (readMaybe =<< (toS <$> v))) | (k,v) <- qParams, isJust v, endingIn ["offset"] k]
 
   urlRange = M.unionWith f limitParams offsetParams
     where
@@ -237,23 +262,6 @@ mutuallyAgreeable sProduces cAccepts =
   if isNothing exact && CTAny `elem` cAccepts
      then listToMaybe sProduces
      else exact
-
--- PRIVATE ---------------------------------------------------------------
-
-{-|
-  Warning: discards MIME parameters
--}
-decodeContentType :: BS.ByteString -> ContentType
-decodeContentType ct =
-  case BS.takeWhile (/= BS.c2w ';') ct of
-    "application/json"                  -> CTApplicationJSON
-    "text/csv"                          -> CTTextCSV
-    "application/openapi+json"          -> CTOpenAPI
-    "application/vnd.pgrst.object+json" -> CTSingularJSON
-    "application/vnd.pgrst.object"      -> CTSingularJSON
-    "application/octet-stream"          -> CTOctetStream
-    "*/*"                               -> CTAny
-    ct'                                 -> CTOther ct'
 
 type CsvData = V.Vector (M.HashMap Text BL.ByteString)
 
@@ -292,14 +300,14 @@ payloadAttributes raw json =
                 JSON.Object x -> S.fromList (M.keys x) == canonicalKeys
                 _ -> False) arr in
           if areKeysUniform
-            then Just $ PayloadJSON raw (PJArray $ V.length arr) canonicalKeys
+            then Just $ ProcessedJSON raw (PJArray $ V.length arr) canonicalKeys
             else Nothing
         Just _ -> Nothing
         Nothing -> Just emptyPJArray
 
-    JSON.Object o -> Just $ PayloadJSON raw PJObject (S.fromList $ M.keys o)
+    JSON.Object o -> Just $ ProcessedJSON raw PJObject (S.fromList $ M.keys o)
 
     -- truncate everything else to an empty array.
     _ -> Just emptyPJArray
   where
-    emptyPJArray = PayloadJSON (JSON.encode emptyArray) (PJArray 0) S.empty
+    emptyPJArray = ProcessedJSON (JSON.encode emptyArray) (PJArray 0) S.empty

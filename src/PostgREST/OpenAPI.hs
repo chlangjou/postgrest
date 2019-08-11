@@ -1,40 +1,54 @@
+{-|
+Module      : PostgREST.OpenAPI
+Description : Generates the OpenAPI output
+-}
 {-# LANGUAGE OverloadedStrings #-}
 
 module PostgREST.OpenAPI (
   encodeOpenAPI
-  , isMalformedProxyUri
-  , pickProxy
-  ) where
+, isMalformedProxyUri
+, pickProxy
+) where
 
-import           Control.Arrow               ((&&&))
-import           Control.Lens
-import           Data.Aeson                  (decode, encode)
-import           Data.HashMap.Strict.InsOrd  (InsOrdHashMap, fromList)
-import           Data.Maybe                  (fromJust)
-import qualified Data.Set                    as Set
-import           Data.String                 (IsString (..))
-import           Data.Text                   (unpack, pack, init, tail, toLower, intercalate, append, dropWhile, breakOn)
-import           Network.URI                 (parseURI, isAbsoluteURI,
-                                              URI (..), URIAuth (..))
+import qualified Data.Set as Set
 
-import           Protolude hiding              ((&), Proxy, get, intercalate, dropWhile)
+import Control.Arrow              ((&&&))
+import Data.Aeson                 (decode, encode)
+import Data.HashMap.Strict.InsOrd (InsOrdHashMap, fromList)
+import Data.Maybe                 (fromJust)
+import Data.String                (IsString (..))
+import Data.Text                  (append, breakOn, dropWhile, init,
+                                   intercalate, pack, tail, toLower,
+                                   unpack)
+import Network.URI                (URI (..), URIAuth (..),
+                                   isAbsoluteURI, parseURI)
 
-import           Data.Swagger
+import Control.Lens
+import Data.Swagger
 
-import           PostgREST.ApiRequest        (ContentType(..))
-import           PostgREST.Config            (prettyVersion, docsVersion)
-import           PostgREST.Types             (Table(..), Column(..), PgArg(..), ForeignKey(..),
-                                              PrimaryKey(..), Proxy(..), ProcDescription(..), toMime)
+import PostgREST.ApiRequest (ContentType (..))
+import PostgREST.Config     (docsVersion, prettyVersion)
+import PostgREST.Types      (Column (..), ForeignKey (..), PgArg (..),
+                             PrimaryKey (..), ProcDescription (..),
+                             Proxy (..), Table (..), toMime)
+import Protolude            hiding (Proxy, dropWhile, get,
+                             intercalate, (&))
 
 makeMimeList :: [ContentType] -> MimeList
 makeMimeList cs = MimeList $ map (fromString . toS . toMime) cs
 
 toSwaggerType :: Text -> SwaggerType t
-toSwaggerType "text"      = SwaggerString
-toSwaggerType "integer"   = SwaggerInteger
-toSwaggerType "boolean"   = SwaggerBoolean
-toSwaggerType "numeric"   = SwaggerNumber
-toSwaggerType _           = SwaggerString
+toSwaggerType "character varying" = SwaggerString
+toSwaggerType "character"         = SwaggerString
+toSwaggerType "text"              = SwaggerString
+toSwaggerType "boolean"           = SwaggerBoolean
+toSwaggerType "smallint"          = SwaggerInteger
+toSwaggerType "integer"           = SwaggerInteger
+toSwaggerType "bigint"            = SwaggerInteger
+toSwaggerType "numeric"           = SwaggerNumber
+toSwaggerType "real"              = SwaggerNumber
+toSwaggerType "double precision"  = SwaggerNumber
+toSwaggerType _                   = SwaggerString
 
 makeTableDef :: [PrimaryKey] -> (Table, [Column], [Text]) -> (Text, Schema)
 makeTableDef pks (t, cs, _) =
@@ -42,7 +56,8 @@ makeTableDef pks (t, cs, _) =
       (tn, (mempty :: Schema)
         & description .~ tableDescription t
         & type_ .~ SwaggerObject
-        & properties .~ fromList (map (makeProperty pks) cs))
+        & properties .~ fromList (map (makeProperty pks) cs)
+        & required .~ map colName (filter (not . colNullable) cs))
 
 makeProperty :: [PrimaryKey] -> Column -> (Text, Referenced Schema)
 makeProperty pks c = (colName c, Inline s)
@@ -59,7 +74,7 @@ makeProperty pks c = (colName c, Inline s)
       ]
     d =
       if length n > 1 then
-        Just $ append (fromMaybe "" ((`append` "\n\n") <$> colDescription c)) (intercalate "\n" n)
+        Just $ append (maybe "" (`append` "\n\n") $ colDescription c) (intercalate "\n" n)
       else
         colDescription c
     s =
@@ -197,10 +212,13 @@ makePathItem (t, cs, _) = ("/" ++ unpack tn, p $ tableInsertable t)
       & at 206 ?~ "Partial Content"
       & at 200 ?~ Inline ((mempty :: Response)
         & description .~ "OK"
-        & schema ?~ (Ref $ Reference $ tableName t)
+        & schema ?~ Inline (mempty
+          & type_ .~ SwaggerArray
+          & items ?~ (SwaggerItemsObject $ Ref $ Reference $ tableName t)
         )
+      )
     postOp = tOp
-      & parameters .~ map ref ["body." <> tn, "preferReturn"]
+      & parameters .~ map ref ["body." <> tn, "select", "preferReturn"]
       & at 201 ?~ "Created"
     patchOp = tOp
       & parameters .~ map ref (rs <> ["body." <> tn, "preferReturn"])
@@ -219,8 +237,13 @@ makePathItem (t, cs, _) = ("/" ++ unpack tn, p $ tableInsertable t)
 makeProcPathItem :: ProcDescription -> (FilePath, PathItem)
 makeProcPathItem pd = ("/rpc/" ++ toS (pdName pd), pe)
   where
+    -- Use first line of proc description as summary; rest as description (if present)
+    -- We strip leading newlines from description so that users can include a blank line between summary and description
+    (pSum, pDesc) = fmap fst &&& fmap (dropWhile (=='\n') . snd) $
+                    breakOn "\n" <$> pdDescription pd
     postOp = (mempty :: Operation)
-      & description .~ pdDescription pd
+      & summary .~ pSum
+      & description .~ mfilter (/="") pDesc
       & parameters .~ makeProcParam pd
       & tags .~ Set.fromList ["(rpc) " <> pdName pd]
       & produces ?~ makeMimeList [CTApplicationJSON, CTSingularJSON]
@@ -260,7 +283,7 @@ postgrestSpec pds ti (s, h, p, b) sd pks = (mempty :: Swagger)
       & description ?~ d)
   & externalDocs ?~ ((mempty :: ExternalDocs)
     & description ?~ "PostgREST Documentation"
-    & url .~ URL ("https://postgrest.com/en/" <> docsVersion <> "/api.html"))
+    & url .~ URL ("https://postgrest.org/en/" <> docsVersion <> "/api.html"))
   & host .~ h'
   & definitions .~ fromList (map (makeTableDef pks) ti)
   & parameters .~ fromList (makeParamDefs ti)
@@ -310,7 +333,7 @@ pickProxy proxy
    uri = toURI $ fromJust proxy
    scheme = init $ toLower $ pack $ uriScheme uri
    path URI {uriPath = ""} =  "/"
-   path URI {uriPath = p} = p
+   path URI {uriPath = p}  = p
    path' = pack $ path uri
    authority = fromJust $ uriAuthority uri
    host' = pack $ uriRegName authority
@@ -318,15 +341,15 @@ pickProxy proxy
    readPort = fromMaybe 80 . readMaybe
    port'' :: Integer
    port'' = case (port', scheme) of
-             ("", "http") -> 80
+             ("", "http")  -> 80
              ("", "https") -> 443
-             _ -> readPort $ unpack $ tail $ pack port'
+             _             -> readPort $ unpack $ tail $ pack port'
 
 isUriValid:: URI -> Bool
 isUriValid = fAnd [isSchemeValid, isQueryValid, isAuthorityValid]
 
 fAnd :: [a -> Bool] -> a -> Bool
-fAnd fs x = all ($x) fs
+fAnd fs x = all ($ x) fs
 
 isSchemeValid :: URI -> Bool
 isSchemeValid URI {uriScheme = s}
@@ -336,7 +359,7 @@ isSchemeValid URI {uriScheme = s}
 
 isQueryValid :: URI -> Bool
 isQueryValid URI {uriQuery = ""} = True
-isQueryValid _ = False
+isQueryValid _                   = False
 
 isAuthorityValid :: URI -> Bool
 isAuthorityValid URI {uriAuthority = a}
@@ -345,16 +368,16 @@ isAuthorityValid URI {uriAuthority = a}
 
 isUserInfoValid :: URIAuth -> Bool
 isUserInfoValid URIAuth {uriUserInfo = ""} = True
-isUserInfoValid _ = False
+isUserInfoValid _                          = False
 
 isHostValid :: URIAuth -> Bool
 isHostValid URIAuth {uriRegName = ""} = False
-isHostValid _ = True
+isHostValid _                         = True
 
 isPortValid :: URIAuth -> Bool
 isPortValid URIAuth {uriPort = ""} = True
 isPortValid URIAuth {uriPort = (':':p)} =
   case readMaybe p of
-    Just i -> i > (0 :: Integer) && i < 65536
+    Just i  -> i > (0 :: Integer) && i < 65536
     Nothing -> False
 isPortValid _ = False

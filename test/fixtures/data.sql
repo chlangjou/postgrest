@@ -250,7 +250,7 @@ INSERT INTO tsearch VALUES (to_tsvector('It''s kind of fun to do the impossible'
 INSERT INTO tsearch VALUES (to_tsvector('But also fun to do what is possible'));
 INSERT INTO tsearch VALUES (to_tsvector('Fat cats ate rats'));
 INSERT INTO tsearch VALUES (to_tsvector('french', 'C''est un peu amusant de faire l''impossible'));
-INSERT INTO tsearch VALUES (to_tsvector('german', 'Es ist eine Art Spaß, das Unmögliche zu machen')); 
+INSERT INTO tsearch VALUES (to_tsvector('german', 'Es ist eine Art Spaß, das Unmögliche zu machen'));
 
 --
 -- Data for Name: users_projects; Type: TABLE DATA; Schema: test; Owner: -
@@ -354,11 +354,21 @@ INSERT INTO family_tree VALUES ('3', 'Kid Two', '1');
 INSERT INTO family_tree VALUES ('4', 'Grandkid One', '2');
 INSERT INTO family_tree VALUES ('5', 'Grandkid Two', '3');
 
+TRUNCATE TABLE managers CASCADE;
+INSERT INTO managers VALUES (1, 'Referee Manager');
+INSERT INTO managers VALUES (2, 'Auditor Manager');
+INSERT INTO managers VALUES (3, 'Acme Manager');
+INSERT INTO managers VALUES (4, 'Umbrella Manager');
+INSERT INTO managers VALUES (5, 'Cyberdyne Manager');
+INSERT INTO managers VALUES (6, 'Oscorp Manager');
+
 TRUNCATE TABLE organizations CASCADE;
-INSERT INTO organizations VALUES (1, 'Referee Org', null, null);
-INSERT INTO organizations VALUES (2, 'Auditor Org', null, null);
-INSERT INTO organizations VALUES (3, 'Acme', 1, 2);
-INSERT INTO organizations VALUES (4, 'Umbrella', 1, 2);
+INSERT INTO organizations VALUES (1, 'Referee Org', null, null, 1);
+INSERT INTO organizations VALUES (2, 'Auditor Org', null, null, 2);
+INSERT INTO organizations VALUES (3, 'Acme', 1, 2, 3);
+INSERT INTO organizations VALUES (4, 'Umbrella', 1, 2, 4);
+INSERT INTO organizations VALUES (5, 'Cyberdyne', 3, 4, 5);
+INSERT INTO organizations VALUES (6, 'Oscorp', 3, 4, 6);
 
 SET search_path = private, pg_catalog;
 
@@ -373,16 +383,27 @@ INSERT INTO authors VALUES (7, 'Harper Lee');
 INSERT INTO authors VALUES (8, 'Kurt Vonnegut');
 INSERT INTO authors VALUES (9, 'Ken Kesey');
 
+TRUNCATE TABLE publishers CASCADE;
+INSERT INTO publishers VALUES (1, 'Secker & Warburg');
+INSERT INTO publishers VALUES (2, 'Contact Publishing');
+INSERT INTO publishers VALUES (3, 'Reynal & Hitchcock');
+INSERT INTO publishers VALUES (4, 'Little, Brown and Company');
+INSERT INTO publishers VALUES (5, 'Ballantine Books');
+INSERT INTO publishers VALUES (6, 'Faber and Faber');
+INSERT INTO publishers VALUES (7, 'J. B. Lippincott & Co.');
+INSERT INTO publishers VALUES (8, 'Delacorte');
+INSERT INTO publishers VALUES (9, 'Viking Press & Signet Books');
+
 TRUNCATE TABLE books CASCADE;
-INSERT INTO books VALUES (1, '1984', 1949, 1);
-INSERT INTO books VALUES (2, 'The Diary of a Young Girl', 1947, 2);
-INSERT INTO books VALUES (3, 'The Little Prince', 1947, 3);
-INSERT INTO books VALUES (4, 'The Catcher in the Rye', 1951, 4);
-INSERT INTO books VALUES (5, 'Farenheit 451', 1953, 5);
-INSERT INTO books VALUES (6, 'Lord of the Flies', 1954, 6);
-INSERT INTO books VALUES (7, 'To Kill a Mockingbird', 1960, 7);
-INSERT INTO books VALUES (8, 'Slaughterhouse-Five', 1969, 8);
-INSERT INTO books VALUES (9, 'One Flew Over the Cuckoo''s Nest', 1962, 9);
+INSERT INTO books VALUES (1, '1984', 1949, 1, 1);
+INSERT INTO books VALUES (2, 'The Diary of a Young Girl', 1947, 2, 2);
+INSERT INTO books VALUES (3, 'The Little Prince', 1947, 3, 3);
+INSERT INTO books VALUES (4, 'The Catcher in the Rye', 1951, 4, 4);
+INSERT INTO books VALUES (5, 'Farenheit 451', 1953, 5, 5);
+INSERT INTO books VALUES (6, 'Lord of the Flies', 1954, 6, 6);
+INSERT INTO books VALUES (7, 'To Kill a Mockingbird', 1960, 7, 7);
+INSERT INTO books VALUES (8, 'Slaughterhouse-Five', 1969, 8, 8);
+INSERT INTO books VALUES (9, 'One Flew Over the Cuckoo''s Nest', 1962, 9, 9);
 
 SET search_path = test, pg_catalog;
 
@@ -408,3 +429,73 @@ INSERT INTO zone VALUES (1, 'zone 1', 2, 1);
 INSERT INTO zone VALUES (2, 'zone 2', 2, 1);
 INSERT INTO zone VALUES (3, 'store 3', 3, 1);
 INSERT INTO zone VALUES (4, 'store 4', 3, 1);
+
+-- for foreign table projects_dump
+copy (select id, name, client_id from projects) to '/tmp/projects_dump.csv' with csv;
+
+TRUNCATE TABLE "UnitTest" CASCADE;
+INSERT INTO "UnitTest" VALUES (1, 'unit test 1');
+
+TRUNCATE TABLE json_arr CASCADE;
+INSERT INTO json_arr VALUES (1, '[1, 2, 3]');
+INSERT INTO json_arr VALUES (2, '[4, 5, 6]');
+INSERT INTO json_arr VALUES (3, '[[9, 8, 7], [11, 12, 13]]');
+INSERT INTO json_arr VALUES (4, '[[[5, 6], 7, 8]]');
+INSERT INTO json_arr VALUES (5, '[{"a": "A"}, {"b": "B"}]');
+INSERT INTO json_arr VALUES (6, '[{"a": [1,2,3]}, {"b": [4,5]}]');
+INSERT INTO json_arr VALUES (7, '{"c": [1,2,3], "d": [4,5]}');
+INSERT INTO json_arr VALUES (8, '{"c": [{"d": [4,5,6,7,8]}]}');
+INSERT INTO json_arr VALUES (9, '[{"0xy1": [1,{"23-xy-45": [2, {"xy-6": [3]}]}]}]');
+
+TRUNCATE TABLE jsonb_test CASCADE;
+INSERT INTO jsonb_test VALUES (1, '{ "a": {"b": 2} }');
+INSERT INTO jsonb_test VALUES (2, '{ "c": [1,2,3] }');
+INSERT INTO jsonb_test VALUES (3, '[{ "d": "test" }]');
+INSERT INTO jsonb_test VALUES (4, '{ "e": 1 }');
+
+TRUNCATE TABLE private.player CASCADE;
+INSERT into private.player
+SELECT
+  generate_series,
+  'first_name_' || generate_series,
+  'last_name_' || generate_series,
+  '2018-10-11'
+FROM generate_series(1, 12);
+
+TRUNCATE TABLE contract CASCADE;
+insert into contract
+select
+  'tournament_' || generate_series,
+  tsrange(now()::timestamp, null),
+  10*generate_series,
+  generate_series,
+  'first_name_' || generate_series,
+  'last_name_' || generate_series,
+  '2018-10-11'
+from generate_series(1, 6);
+
+TRUNCATE TABLE ltree_sample CASCADE;
+INSERT INTO ltree_sample VALUES ('Top');
+INSERT INTO ltree_sample VALUES ('Top.Science');
+INSERT INTO ltree_sample VALUES ('Top.Science.Astronomy');
+INSERT INTO ltree_sample VALUES ('Top.Science.Astronomy.Astrophysics');
+INSERT INTO ltree_sample VALUES ('Top.Science.Astronomy.Cosmology');
+
+TRUNCATE TABLE isn_sample CASCADE;
+INSERT INTO isn_sample VALUES ('978-0-393-04002-9', 'Mathematics: From the Birth of Numbers');
+
+TRUNCATE TABLE "Server Today" CASCADE;
+COPY "Server Today" ("cHostname", "Just A Server Model") FROM STDIN CSV DELIMITER '|';
+argnim1    | IBM,9113-550 (P5-550)
+argnim2    | IBM,9113-550 (P5-550)
+daaa2nim71 | IBM,9131-52A (P5-52A)
+daah3nim71 | IBM,8406-71Y (P7-PS701)
+hbnim1     | IBM,9133-55A (P5-55A)
+\.
+
+TRUNCATE TABLE pgrst_reserved_chars CASCADE;
+COPY pgrst_reserved_chars ("*id*", ":arr->ow::cast", "(inside,parens)", "a.dotted.column", "  col  w  space  ") FROM STDIN CSV DELIMITER '|';
+1 | arrow-1 | parens-1 | dotted-1 | space-1
+2 | arrow-2 | parens-2 | dotted-2 | space-2
+3 | arrow-3 | parens-3 | dotted-3 | space-3
+\.

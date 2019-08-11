@@ -1,17 +1,17 @@
 module Feature.CorsSpec where
 
 -- {{{ Imports
-import Test.Hspec
-import Test.Hspec.Wai
-import Network.Wai.Test (SResponse(simpleHeaders, simpleBody))
 import qualified Data.ByteString.Lazy as BL
 
-import SpecHelper
+import Network.Wai      (Application)
+import Network.Wai.Test (SResponse (simpleBody, simpleHeaders))
 
 import Network.HTTP.Types
-import Network.Wai (Application)
+import Test.Hspec
+import Test.Hspec.Wai
 
-import Protolude hiding (get)
+import Protolude
+import SpecHelper
 -- }}}
 
 spec :: SpecWith Application
@@ -45,7 +45,7 @@ spec =
             "true"
           respHeaders `shouldSatisfy` matchHeader
             "Access-Control-Allow-Methods"
-            "GET, POST, PATCH, DELETE, OPTIONS, HEAD"
+            "GET, POST, PATCH, PUT, DELETE, OPTIONS, HEAD"
           respHeaders `shouldSatisfy` matchHeader
             "Access-Control-Allow-Headers"
             "Authentication, Foo, Bar, Accept, Accept-Language, Content-Language"

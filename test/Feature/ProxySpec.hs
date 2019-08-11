@@ -1,12 +1,10 @@
 module Feature.ProxySpec where
 
-import Test.Hspec hiding (pendingWith)
-
-import SpecHelper
-
 import Network.Wai (Application)
+import Test.Hspec  hiding (pendingWith)
 
-import Protolude hiding (get)
+import Protolude
+import SpecHelper
 
 spec :: SpecWith Application
 spec =

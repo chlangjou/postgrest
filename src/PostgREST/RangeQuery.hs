@@ -1,3 +1,7 @@
+{-|
+Module      : PostgREST.RangeQuery
+Description : Logic regarding the `Range` header and `limit`, `offset` querystring arguments.
+-}
 module PostgREST.RangeQuery (
   rangeParse
 , rangeRequested
@@ -9,19 +13,17 @@ module PostgREST.RangeQuery (
 , NonnegRange
 ) where
 
+import qualified Data.ByteString.Char8 as BS
 
-import           Control.Applicative
-import           Network.HTTP.Types.Header
+import Data.List       (lookup)
+import Text.Regex.TDFA ((=~))
 
-import qualified Data.ByteString.Char8     as BS
-import           Data.Ranged.Boundaries
-import           Data.Ranged.Ranges
+import Control.Applicative
+import Data.Ranged.Boundaries
+import Data.Ranged.Ranges
+import Network.HTTP.Types.Header
 
-import           Text.Regex.TDFA           ((=~))
-
-import Data.List (lookup)
-
-import           Protolude
+import Protolude
 
 type NonnegRange = Range Integer
 
@@ -32,14 +34,13 @@ rangeParse range = do
   case listToMaybe (range =~ rangeRegex :: [[BS.ByteString]]) of
     Just parsedRange ->
       let [_, mLower, mUpper] = readMaybe . toS <$> parsedRange
-          lower         = fromMaybe emptyRange   (rangeGeq <$> mLower)
-          upper         = fromMaybe allRange (rangeLeq <$> mUpper) in
+          lower         = maybe emptyRange rangeGeq mLower
+          upper         = maybe allRange rangeLeq mUpper in
       rangeIntersection lower upper
     Nothing -> allRange
 
 rangeRequested :: RequestHeaders -> NonnegRange
-rangeRequested headers = fromMaybe allRange $
-  rangeParse <$> lookup hRange headers
+rangeRequested headers = maybe allRange rangeParse $ lookup hRange headers
 
 restrictRange :: Maybe Integer -> NonnegRange -> NonnegRange
 restrictRange Nothing r = r
@@ -57,7 +58,7 @@ rangeOffset :: NonnegRange -> Integer
 rangeOffset range =
   case rangeLower range of
     BoundaryBelow lower -> lower
-    _ -> panic "range without lower bound" -- should never happen
+    _                   -> panic "range without lower bound" -- should never happen
 
 rangeGeq :: Integer -> NonnegRange
 rangeGeq n =

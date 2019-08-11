@@ -7,10 +7,116 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+### Fixed
+
+- #1369, Change `raw-media-types` to accept a string of comma separated MIME types - @Dansvidania
+
+## [6.0.1] - 2019-07-30
+
+### Added
+
+- #1349, Add user defined raw output media types via `raw-media-types` config option - @Dansvidania
+- #1243, Add websearch_to_tsquery support - @herulume
+
+### Fixed
+
+- #1336, Error when testing on Chrome/Firefox: text/html requested but a single column was not selected - @Dansvidania
+- #1334, Unable to compile v6.0.0 on windows - @steve-chavez
+
+## [6.0.0] - 2019-06-21
+
+### Added
+
+- #1186, Add support for user defined unix socket via `server-unix-socket` config option - @Dansvidania
+- #690, Add `?columns` query parameter for faster bulk inserts, also ignores unspecified json keys in a payload - @steve-chavez
+- #1239, Add support for resource embedding on materialized views - @vitorbaptista
+- #1264, Add support for bulk RPC call - @steve-chavez
+- #1278, Add db-pool-timeout config option - @qu4tro
+- #1285, Abort on wrong database password - @qu4tro
+- #790, Allow override of OpenAPI spec through `root-spec` config option - @steve-chavez
+- #1308, Accept `text/plain` and `text/html` for raw output - @steve-chavez
+
+
+### Fixed
+
+- #1223, Fix incorrect OpenAPI externalDocs url - @steve-chavez
+- #1221, Fix embedding other resources when having a self join - @steve-chavez
+- #1242, Fix embedding a view having a select in a where - @steve-chavez
+- #1238, Fix PostgreSQL to OpenAPI type mappings for numeric and character types - @fpusch
+- #1265, Fix query generated on bulk upsert with an empty array - @qu4tro
+- #1273, Fix RPC ignoring unknown arguments by default - @steve-chavez
+- #1257, Fix incorrect status when a PATCH request doesn't find rows to change - @qu4tro
+
+### Changed
+
+- #1288, Change server-host default of 127.0.0.1 to !4
+
+### Deprecated
+
+- #1288, Deprecate `.` symbol for disambiguating resource embedding(added in #918). '+' should be used instead. Though '+' is url safe, certain clients might need to encode it to '%2B'.
+
+### Removed
+
+- #1288, Removed support for schema reloading with SIGHUP, SIGUSR1 should be used instead - @steve-chavez
+
+## [5.2.0] - 2018-12-12
+
+### Added
+
+- #1205, Add support for parsing JSON Web Key Sets - @russelldavies
+- #1203, Add support for reading db-uri from a separate file - @zhoufeng1989
+- #1200, Add db-extra-search-path config for adding schemas to the search_path, solves issues related to extensions created on the public schema - @steve-chavez
+- #1219, Add ability to quote column names on filters - @steve-chavez
+
+### Fixed
+
+- #1182, Fix embedding on views with composite pks - @steve-chavez
+- #1180, Fix embedding on views with subselects in pg10 - @steve-chavez
+- #1197, Allow CORS for PUT - @bkylerussell
+- #1181, Correctly qualify function argument of custom type in public schema - @steve-chavez
+- #1008, Allow columns that contain spaces in filters - @steve-chavez
+
+## [5.1.0] - 2018-08-31
+
+### Added
+
+- #1099, Add support for getting json/jsonb by array index - @steve-chavez
+- #1145, Add materialized view columns to OpenAPI output - @steve-chavez
+- #709, Allow embedding on views with subselects/CTE - @steve-chavez
+- #1148, OpenAPI: add `required` section for the non-nullable columns - @laughedelic
+- #1158, Add summary to OpenAPI doc for RPC functions - @mdr1384
+
+### Fixed
+
+- #1113, Fix UPSERT failing when having a camel case PK column - @steve-chavez
+- #945, Fix slow start-up time on big schemas - @steve-chavez
+- #1129, Fix view embedding when table is capitalized - @steve-chavez
+- #1149, OpenAPI: Change `GET` response type to array - @laughedelic
+- #1152, Fix RPC failing when having arguments with reserved or uppercase keywords - @mdr1384
+- #905, Fix intermittent empty replies - @steve-chavez
+- #1139, Fix JWTIssuedAtFuture failure for valid iat claim - @steve-chavez
+- #1141, Fix app.settings resetting on pool timeout - @steve-chavez
+
+### Changed
+
+- #1099, Numbers in json path `?select=data->1->>key` now get treated as json array indexes instead of keys - @steve-chavez
+- #1128, Allow finishing a json path with a single arrow `->`. Now a json can be obtained without resorting to casting, Previously: `/json_arr?select=data->>2::json`, now: `/json_arr?select=data->2` - @steve-chavez
+- #724, Change server-host default of *4 to 127.0.0.1
+
+### Deprecated
+
+- #724, SIGHUP deprecated, SIGUSR1 should be used instead
+
+## [0.5.0.0] - 2018-05-14
+
+### Added
+
 - The configuration (e.g. `postgrest.conf`) now accepts arbitrary settings that will be passed through as session-local database settings. This can be used to pass in secret keys directly as strings, or via OS environment variables. For instance: `app.settings.jwt_secret = "$(MYAPP_JWT_SECRET)"` will take `MYAPP_JWT_SECRET` from the environment and make it available to postgresql functions as `current_setting('app.settings.jwt_secret')`. Only `app.settings.*` values in the configuration file are treated in this way. - @canadaduane
 - #256, Add support for bulk UPSERT with POST and single UPSERT with PUT - @steve-chavez
 - #1078, Add ability to specify source column in embed - @steve-chavez
 - #821, Allow embeds alias to be used in filters - @steve-chavez
+- #906, Add jspath configurable `role-claim-key` - @steve-chavez
+- #1061, Add foreign tables to OpenAPI output - @rhyamada
 
 ### Fixed
 
@@ -18,12 +124,19 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - #925, Fix RPC high memory usage by using parametrized query and avoiding json encoding - @steve-chavez
 - #987, Fix embedding with self-reference foreign key - @steve-chavez
 - #1044, Fix view parent embedding when having many views - @steve-chavez
+- #781, Fix accepting misspelled desc/asc ordering modificators - @onporat, @steve-chavez
 
 ### Changed
 
-- Computed columns now only work if they belong to the db-schema - @steve-chavez
+- #828, A `SET SCHEMA <db-schema>` is done on each request, this has the following implications:
+  - Computed columns now only work if they belong to the db-schema
+  - Stored procedures might require a `search_path` to work properly, for further details see https://postgrest.org/en/v5.0/api.html#explicit-qualification
 - To use RPC now the `json_to_record/json_to_recordset` functions are needed, these are available starting from PostgreSQL 9.4 - @steve-chavez
 - Overloaded functions now depend on the `dbStructure`, restart/sighup may be needed for their correct functioning - @steve-chavez
+- #1098, Removed support for:
+  + curly braces `{}` in embeds, i.e. `/clients?select=*,projects{*}` can no longer be used, from now on parens `()` should be used `/clients?select=*,projects(*)` - @steve-chavez
+  + "in" operator without parens, i.e. `/clients?id=in.1,2,3` no longer supported, `/clients?id=in.(1,2,3)` should be used - @steve-chavez
+  + "@@", "@>" and "<@" operators, from now on their mnemonic equivalents should be used "fts", "cs" and "cd" respectively - @steve-chavez
 
 ## [0.4.4.0] - 2018-01-08
 

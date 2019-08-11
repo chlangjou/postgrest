@@ -1,26 +1,36 @@
 module Feature.AuthSpec where
 
-import Text.Heredoc
+import Network.Wai (Application)
+
+import Network.HTTP.Types
 import Test.Hspec
 import Test.Hspec.Wai
 import Test.Hspec.Wai.JSON
-import Network.HTTP.Types
+import Text.Heredoc
 
+import PostgREST.Types (PgVersion, pgVersion112)
+import Protolude       hiding (get)
 import SpecHelper
-import Network.Wai (Application)
 
-import Protolude hiding (get)
-
-spec :: SpecWith Application
-spec = describe "authorization" $ do
+spec :: PgVersion -> SpecWith Application
+spec actualPgVersion = describe "authorization" $ do
   let single = ("Accept","application/vnd.pgrst.object+json")
 
   it "denies access to tables that anonymous does not own" $
-    get "/authors_only" `shouldRespondWith` [json| {
+    get "/authors_only" `shouldRespondWith` (
+        if actualPgVersion >= pgVersion112 then
+        [json| {
+          "hint":null,
+          "details":null,
+          "code":"42501",
+          "message":"permission denied for table authors_only"} |]
+           else
+        [json| {
           "hint":null,
           "details":null,
           "code":"42501",
           "message":"permission denied for relation authors_only"} |]
+                                            )
       { matchStatus = 401
       , matchHeaders = ["WWW-Authenticate" <:> "Bearer"]
       }
@@ -28,11 +38,20 @@ spec = describe "authorization" $ do
   it "denies access to tables that postgrest_test_author does not own" $
     let auth = authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA" in
     request methodGet "/private_table" [auth] ""
-      `shouldRespondWith` [json| {
+      `shouldRespondWith` (
+        if actualPgVersion >= pgVersion112 then
+        [json| {
+          "hint":null,
+          "details":null,
+          "code":"42501",
+          "message":"permission denied for table private_table"} |]
+           else
+        [json| {
           "hint":null,
           "details":null,
           "code":"42501",
           "message":"permission denied for relation private_table"} |]
+                          )
       { matchStatus = 403
       , matchHeaders = []
       }
@@ -98,11 +117,11 @@ spec = describe "authorization" $ do
   it "hides tables from users with invalid JWT" $ do
     let auth = authHeaderJWT "ey9zdGdyZXN0X3Rlc3RfYXV0aG9yIiwiaWQiOiJqZG9lIn0.y4vZuu1dDdwAl0-S00MCRWRYMlJ5YAMSir6Es6WtWx0"
     request methodGet "/authors_only" [auth] ""
-      `shouldRespondWith` [json| {"message":"JWSError (CompactDecodeError \"expected 3 parts, got 2\")"} |]
+      `shouldRespondWith` [json| {"message":"JWSError (CompactDecodeError Invalid number of parts: Expected 3 parts; got 2)"} |]
         { matchStatus = 401
         , matchHeaders = [
             "WWW-Authenticate" <:>
-            "Bearer error=\"invalid_token\", error_description=\"JWSError (CompactDecodeError \\\"expected 3 parts, got 2\\\")\""
+            "Bearer error=\"invalid_token\", error_description=\"JWSError (CompactDecodeError Invalid number of parts: Expected 3 parts; got 2)\""
           ]
         }
 

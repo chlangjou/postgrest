@@ -2,40 +2,51 @@
 
 module Main where
 
+import qualified Data.ByteString            as BS
+import qualified Data.ByteString.Base64     as B64
+import qualified Hasql.Pool                 as P
+import qualified Hasql.Transaction.Sessions as HT
 
-import           PostgREST.App            (postgrest)
-import           PostgREST.Config         (AppConfig (..),
-                                           minimumPgVersion,
-                                           prettyVersion, readOptions)
-import           PostgREST.DbStructure    (getDbStructure, getPgVersion,
-                                           fillSessionWithSettings)
-import           PostgREST.Error          (encodeError)
-import           PostgREST.OpenAPI        (isMalformedProxyUri)
-import           PostgREST.Types          (DbStructure, Schema, PgVersion(..))
-import           Protolude                hiding (hPutStrLn, replace)
+import Control.AutoUpdate       (defaultUpdateSettings, mkAutoUpdate,
+                                 updateAction)
+import Control.Retry            (RetryStatus, capDelay,
+                                 exponentialBackoff, retrying,
+                                 rsPreviousDelay)
+import Data.IORef               (IORef, atomicWriteIORef, newIORef,
+                                 readIORef)
+import Data.String              (IsString (..))
+import Data.Text                (pack, replace, strip, stripPrefix,
+                                 unpack)
+import Data.Text.Encoding       (decodeUtf8, encodeUtf8)
+import Data.Text.IO             (hPutStrLn, readFile)
+import Data.Time.Clock          (getCurrentTime)
+import Network.Socket           (Family (AF_UNIX),
+                                 SockAddr (SockAddrUnix), Socket,
+                                 SocketType (Stream), bind, close,
+                                 defaultProtocol, listen,
+                                 maxListenQueue, socket)
+import Network.Wai.Handler.Warp (defaultSettings, runSettings,
+                                 runSettingsSocket, setHost, setPort,
+                                 setServerName)
+import System.Directory         (removeFile)
+import System.IO                (BufferMode (..), hSetBuffering)
+import System.IO.Error          (isDoesNotExistError)
 
-import           Control.Retry            (RetryStatus, capDelay,
-                                           exponentialBackoff,
-                                           retrying, rsPreviousDelay)
-import qualified Data.ByteString          as BS
-import qualified Data.ByteString.Base64   as B64
-import           Data.IORef               (IORef, atomicWriteIORef,
-                                           newIORef, readIORef)
-import           Data.String              (IsString (..))
-import           Data.Text                (pack, replace, stripPrefix, strip)
-import           Data.Text.Encoding       (decodeUtf8, encodeUtf8)
-import           Data.Text.IO             (hPutStrLn)
-import qualified Hasql.Pool               as P
-import qualified Hasql.Session            as H
-import           Network.Wai.Handler.Warp (defaultSettings,
-                                           runSettings, setHost,
-                                           setPort, setServerName,
-                                           setTimeout)
-import           System.IO                (BufferMode (..),
-                                           hSetBuffering)
+import PostgREST.App         (postgrest)
+import PostgREST.Config      (AppConfig (..), configPoolTimeout',
+                              prettyVersion, readOptions)
+import PostgREST.DbStructure (getDbStructure, getPgVersion)
+import PostgREST.Error       (PgError (PgError), checkIsFatal,
+                              errorPayload)
+import PostgREST.OpenAPI     (isMalformedProxyUri)
+import PostgREST.Types       (ConnectionStatus (..), DbStructure,
+                              PgVersion (..), Schema,
+                              minimumPgVersion)
+import Protolude             hiding (hPutStrLn, replace)
+
 
 #ifndef mingw32_HOST_OS
-import           System.Posix.Signals
+import System.Posix.Signals
 #endif
 
 {-|
@@ -60,11 +71,10 @@ connectionWorker
   :: ThreadId -- ^ This thread is killed if pg version is unsupported
   -> P.Pool   -- ^ The PostgreSQL connection pool
   -> Schema   -- ^ Schema PostgREST is serving up
-  -> [(Text, Text)] -- ^ Settings or Environment passed in through the config
   -> IORef (Maybe DbStructure) -- ^ mutable reference to 'DbStructure'
   -> IORef Bool                -- ^ Used as a binary Semaphore
   -> IO ()
-connectionWorker mainTid pool schema settings refDbStructure refIsWorkerOn = do
+connectionWorker mainTid pool schema refDbStructure refIsWorkerOn = do
   isWorkerOn <- readIORef refIsWorkerOn
   unless isWorkerOn $ do
     atomicWriteIORef refIsWorkerOn True
@@ -73,26 +83,24 @@ connectionWorker mainTid pool schema settings refDbStructure refIsWorkerOn = do
     work = do
       atomicWriteIORef refDbStructure Nothing
       putStrLn ("Attempting to connect to the database..." :: Text)
-      connected <- connectingSucceeded pool
-      when connected $ do
-        result <- P.use pool $ do
-          actualPgVersion <- getPgVersion
-          unless (actualPgVersion >= minimumPgVersion) $ liftIO $ do
-            hPutStrLn stderr
-              ("Cannot run in this PostgreSQL version, PostgREST needs at least "
-              <> pgvName minimumPgVersion)
-            killThread mainTid
-          fillSessionWithSettings settings
-          dbStructure <- getDbStructure schema actualPgVersion
-          liftIO $ atomicWriteIORef refDbStructure $ Just dbStructure
-        case result of
-          Left e -> do
-            putStrLn ("Failed to query the database. Retrying." :: Text)
-            hPutStrLn stderr (toS $ encodeError e)
-            work
-          Right _ -> do
-            atomicWriteIORef refIsWorkerOn False
-            putStrLn ("Connection successful" :: Text)
+      connected <- connectionStatus pool
+      case connected of
+        FatalConnectionError reason -> hPutStrLn stderr reason
+                                      >> killThread mainTid    -- Fatal error when connecting
+        NotConnected                -> return ()               -- Unreachable
+        Connected actualPgVersion   -> do                      -- Procede with initialization
+          result <- P.use pool $ do
+            dbStructure <- HT.transaction HT.ReadCommitted HT.Read $ getDbStructure schema actualPgVersion
+            liftIO $ atomicWriteIORef refDbStructure $ Just dbStructure
+          case result of
+            Left e -> do
+              putStrLn ("Failed to query the database. Retrying." :: Text)
+              hPutStrLn stderr . toS . errorPayload $ PgError False e
+              work
+
+            Right _ -> do
+              atomicWriteIORef refIsWorkerOn False
+              putStrLn ("Connection successful" :: Text)
 
 {-|
   Used by 'connectionWorker' to check if the provided db-uri lets
@@ -103,25 +111,36 @@ connectionWorker mainTid pool schema settings refDbStructure refIsWorkerOn = do
   The connection tries are capped, but if the connection times out no error is
   thrown, just 'False' is returned.
 -}
-connectingSucceeded :: P.Pool -> IO Bool
-connectingSucceeded pool =
+connectionStatus :: P.Pool -> IO ConnectionStatus
+connectionStatus pool =
   retrying (capDelay 32000000 $ exponentialBackoff 1000000)
            shouldRetry
-           (const $ P.release pool >> isConnectionSuccessful)
+           (const $ P.release pool >> getConnectionStatus)
   where
-    isConnectionSuccessful :: IO Bool
-    isConnectionSuccessful = do
-      testConn <- P.use pool $ H.sql "SELECT 1"
-      case testConn of
-        Left e -> hPutStrLn stderr (toS $ encodeError e) >> pure False
-        _ -> pure True
-    shouldRetry :: RetryStatus -> Bool -> IO Bool
+    getConnectionStatus :: IO ConnectionStatus
+    getConnectionStatus = do
+      pgVersion <- P.use pool getPgVersion
+      case pgVersion of
+        Left e -> do
+          let err = PgError False e
+          hPutStrLn stderr . toS $ errorPayload err
+          case checkIsFatal err of
+            Just reason -> return $ FatalConnectionError reason
+            Nothing     -> return NotConnected
+
+        Right version ->
+          if version < minimumPgVersion
+             then return . FatalConnectionError $ "Cannot run in this PostgreSQL version, PostgREST needs at least " <> pgvName minimumPgVersion
+             else return . Connected  $ version
+
+    shouldRetry :: RetryStatus -> ConnectionStatus -> IO Bool
     shouldRetry rs isConnSucc = do
-      delay <- pure $ fromMaybe 0 (rsPreviousDelay rs) `div` 1000000
-      itShould <- pure $ not isConnSucc
+      let delay    = fromMaybe 0 (rsPreviousDelay rs) `div` 1000000
+          itShould = NotConnected == isConnSucc
       when itShould $
         putStrLn $ "Attempting to reconnect to the database in " <> (show delay::Text) <> " seconds..."
       return itShould
+
 
 {-|
   This is where everything starts.
@@ -139,28 +158,32 @@ main = do
   --
   -- readOptions builds the 'AppConfig' from the config file specified on the
   -- command line
-  conf <- loadSecretFile =<< readOptions
+  conf <- loadDbUriFile =<< loadSecretFile =<< readOptions
   let host = configHost conf
       port = configPort conf
       proxy = configProxyUri conf
+      maybeSocketAddr = configSocket conf
       pgSettings = toS (configDatabase conf) -- is the db-uri
+      roleClaimKey = configRoleClaimKey conf
       appSettings =
         setHost ((fromString . toS) host) -- Warp settings
         . setPort port
-        . setServerName (toS $ "postgrest/" <> prettyVersion)
-        . setTimeout 3600 $
+        . setServerName (toS $ "postgrest/" <> prettyVersion) $
         defaultSettings
-  --
-  -- Checks that the provided proxy uri is formated correctly,
-  -- does not test if it works here.
+
+  -- Checks that the provided proxy uri is formated correctly
   when (isMalformedProxyUri $ toS <$> proxy) $
     panic
       "Malformed proxy uri, a correct example: https://example.com:8443/basePath"
-  putStrLn $ ("Listening on port " :: Text) <> show (configPort conf)
+
+  -- Checks that the provided jspath is valid
+  when (isLeft roleClaimKey) $
+    panic $ show roleClaimKey
+
   --
   -- create connection pool with the provided settings, returns either
   -- a 'Connection' or a 'ConnectionError'. Does not throw.
-  pool <- P.acquire (configPool conf, 10, pgSettings)
+  pool <- P.acquire (configPool conf, configPoolTimeout' conf, pgSettings)
   --
   -- To be filled in by connectionWorker
   refDbStructure <- newIORef Nothing
@@ -177,7 +200,6 @@ main = do
     mainTid
     pool
     (configSchema conf)
-    (configSettings conf)
     refDbStructure
     refIsWorkerOn
   --
@@ -195,31 +217,45 @@ main = do
         throwTo mainTid UserInterrupt
       ) Nothing
 
-  void $ installHandler sigHUP (
+  void $ installHandler sigUSR1 (
     Catch $ connectionWorker
               mainTid
               pool
               (configSchema conf)
-              (configSettings conf)
               refDbStructure
               refIsWorkerOn
     ) Nothing
 #endif
 
-  --
-  -- run the postgrest application
-  runSettings appSettings $
-    postgrest
-      conf
-      refDbStructure
-      pool
-      (connectionWorker
-         mainTid
-         pool
-         (configSchema conf)
-         (configSettings conf)
-         refDbStructure
-         refIsWorkerOn)
+
+  -- ask for the OS time at most once per second
+  getTime <- mkAutoUpdate defaultUpdateSettings {updateAction = getCurrentTime}
+
+  let postgrestApplication =
+        postgrest
+          conf
+          refDbStructure
+          pool
+          getTime
+          (connectionWorker
+             mainTid
+             pool
+             (configSchema conf)
+             refDbStructure
+             refIsWorkerOn)
+    in case maybeSocketAddr of
+         Nothing -> do
+             -- run the postgrest application
+             putStrLn $ ("Listening on port " :: Text) <> show (configPort conf)
+             runSettings appSettings postgrestApplication
+         Just socketAddr -> do
+             -- run postgrest application with user defined socket
+             sock <- createAndBindSocket (unpack socketAddr)
+             listen sock maxListenQueue
+             putStrLn $ ("Listening on unix socket " :: Text) <> show socketAddr
+             runSettingsSocket appSettings sock postgrestApplication
+             -- clean socket up when done
+             close sock
 
 {-|
   The purpose of this function is to load the JWT secret from a file if
@@ -272,3 +308,30 @@ loadSecretFile conf = extractAndTransform mSecret
     -- replace: Replace every occurrence of one substring with another
     replaceUrlChars =
       replace "_" "/" . replace "-" "+" . replace "." "="
+
+{-
+  Load database uri from a separate file if `db-uri` is a filepath.
+-}
+loadDbUriFile :: AppConfig -> IO AppConfig
+loadDbUriFile conf = extractDbUri mDbUri
+  where
+    mDbUri = configDatabase conf
+    extractDbUri :: Text -> IO AppConfig
+    extractDbUri dbUri =
+      fmap setDbUri $
+      case stripPrefix "@" dbUri of
+        Nothing       -> return dbUri
+        Just filename -> strip <$> readFile (toS filename)
+    setDbUri dbUri = conf {configDatabase = dbUri}
+
+createAndBindSocket :: FilePath -> IO Socket
+createAndBindSocket filePath = do
+  deleteSocketFileIfExist filePath
+  sock <- socket AF_UNIX Stream defaultProtocol
+  bind sock $ SockAddrUnix filePath
+  return sock
+  where
+    deleteSocketFileIfExist path = removeFile path `catch` handleDoesNotExist
+    handleDoesNotExist e
+      | isDoesNotExistError e = return ()
+      | otherwise = throwIO e

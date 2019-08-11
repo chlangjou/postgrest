@@ -1,17 +1,17 @@
 module Feature.RangeSpec where
 
+import qualified Data.ByteString.Lazy as BL
+
+import Network.Wai      (Application)
+import Network.Wai.Test (SResponse (simpleHeaders, simpleStatus))
+
+import Network.HTTP.Types
 import Test.Hspec
 import Test.Hspec.Wai
 import Test.Hspec.Wai.JSON
-import Network.HTTP.Types
-import Network.Wai.Test (SResponse(simpleHeaders,simpleStatus))
 
-import qualified Data.ByteString.Lazy         as BL
-
+import Protolude  hiding (get)
 import SpecHelper
-import Network.Wai (Application)
-
-import Protolude hiding (get)
 
 defaultRange :: BL.ByteString
 defaultRange = [json| { "min": 0, "max": 15 } |]
@@ -38,7 +38,6 @@ spec = do
             { matchHeaders = ["Content-Range" <:> "0-14/*"] }
 
     context "with range headers" $ do
-
       context "of acceptable range" $ do
         it "succeeds with partial content" $ do
           r <- request methodPost  "/rpc/getitemrange"
@@ -149,13 +148,12 @@ spec = do
           }
 
       it "limit works on all levels" $
-        get "/clients?select=id,projects{id,tasks{id}}&order=id.asc&limit=1&projects.order=id.asc&projects.limit=2&projects.tasks.order=id.asc&projects.tasks.limit=1"
+        get "/clients?select=id,projects(id,tasks(id))&order=id.asc&limit=1&projects.order=id.asc&projects.limit=2&projects.tasks.order=id.asc&projects.tasks.limit=1"
           `shouldRespondWith`
           [json|[{"id":1,"projects":[{"id":1,"tasks":[{"id":1}]},{"id":2,"tasks":[{"id":3}]}]}]|]
           { matchStatus  = 200
           , matchHeaders = ["Content-Range" <:> "0-0/*"]
           }
-
 
       it "limit and offset works on first level" $
         get "/items?select=id&order=id.asc&limit=3&offset=2"
@@ -164,8 +162,37 @@ spec = do
           , matchHeaders = ["Content-Range" <:> "2-4/*"]
           }
 
-    context "with range headers" $ do
+      it "succeeds if offset equals 0 as a no-op" $
+        get "/items?select=id&offset=0"
+          `shouldRespondWith`
+          [json|[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15}]|]
+          { matchStatus  = 200
+          , matchHeaders = ["Content-Range" <:> "0-14/*"]
+          }
 
+      it "succeeds if offset is negative as a no-op" $
+        get "/items?select=id&offset=-4"
+          `shouldRespondWith`
+          [json|[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5},{"id":6},{"id":7},{"id":8},{"id":9},{"id":10},{"id":11},{"id":12},{"id":13},{"id":14},{"id":15}]|]
+          { matchStatus  = 200
+          , matchHeaders = ["Content-Range" <:> "0-14/*"]
+          }
+
+      it "fails if limit equals 0" $
+        get "/items?select=id&limit=0"
+          `shouldRespondWith` [json|{"message":"HTTP Range error"}|]
+          { matchStatus  = 416
+          , matchHeaders = [matchContentTypeJson]
+          }
+
+      it "fails if limit is negative" $
+        get "/items?select=id&limit=-1"
+          `shouldRespondWith` [json|{"message":"HTTP Range error"}|]
+          { matchStatus  = 416
+          , matchHeaders = [matchContentTypeJson]
+          }
+
+    context "with range headers" $ do
       context "of acceptable range" $ do
         it "succeeds with partial content" $ do
           r <- request methodGet  "/items"

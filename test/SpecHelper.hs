@@ -1,33 +1,29 @@
 module SpecHelper where
 
-import Control.Monad (void)
+import qualified Data.ByteString.Base64 as B64 (decodeLenient, encode)
+import qualified Data.ByteString.Char8  as BS
+import qualified Data.ByteString.Lazy   as BL
+import qualified Data.Map.Strict        as M
+import qualified Data.Set               as S
+import qualified System.IO.Error        as E
 
-import qualified System.IO.Error as E
-import System.Environment (getEnv)
+import Control.Monad        (void)
+import Data.Aeson           (Value (..), decode, encode)
+import Data.CaseInsensitive (CI (..))
+import Data.List            (lookup)
+import Network.Wai.Test     (SResponse (simpleBody, simpleHeaders, simpleStatus))
+import System.Environment   (getEnv)
+import System.Process       (readProcess)
+import Text.Regex.TDFA      ((=~))
 
-import qualified Data.ByteString.Base64 as B64 (encode, decodeLenient)
-import Data.CaseInsensitive (CI(..))
-import qualified Data.Set as S
-import qualified Data.Map.Strict as M
-import Data.List (lookup)
-import Text.Regex.TDFA ((=~))
-import qualified Data.ByteString.Char8 as BS
-import qualified Data.ByteString.Lazy as BL
-import           System.Process (readProcess)
-import           Text.Heredoc
-
-import PostgREST.Config (AppConfig(..))
-
-import Test.Hspec hiding (pendingWith)
-import Test.Hspec.Wai
 
 import Network.HTTP.Types
-import Network.Wai.Test (SResponse(simpleStatus, simpleHeaders, simpleBody))
+import Test.Hspec
+import Test.Hspec.Wai
+import Text.Heredoc
 
-import Data.Maybe (fromJust)
-import Data.Aeson (decode, Value(..))
-import qualified JSONSchema.Draft4 as D4
-
+import PostgREST.Config (AppConfig (..))
+import PostgREST.Types  (JSPathExp (..), QualifiedIdentifier (..))
 import Protolude
 
 matchContentTypeJson :: MatchHeader
@@ -47,35 +43,46 @@ validateOpenApiResponse headers = do
     let respHeaders = simpleHeaders r in
     respHeaders `shouldSatisfy`
       \hs -> ("Content-Type", "application/openapi+json; charset=utf-8") `elem` hs
-  liftIO $
-    let respBody = simpleBody r
-        schema :: D4.Schema
-        schema = D4.emptySchema { D4._schemaRef = Just "openapi.json" }
-        schemaContext :: D4.SchemaWithURI D4.Schema
-        schemaContext = D4.SchemaWithURI
-          { D4._swSchema = schema
-          , D4._swURI    = Just "test/fixtures/openapi.json"
-          }
-       in
-       D4.fetchFilesystemAndValidate schemaContext ((fromJust . decode) respBody) `shouldReturn` Right ()
+  let Just body = decode (simpleBody r)
+  Just schema <- liftIO $ decode <$> BL.readFile "test/fixtures/openapi.json"
+  let args :: M.Map Text Value
+      args = M.fromList
+        [ ( "schema", schema )
+        , ( "data", body ) ]
+      hdrs = acceptHdrs "application/json"
+  request methodPost "/rpc/validate_json_schema" hdrs (encode args)
+      `shouldRespondWith` "true"
+      { matchStatus = 200
+      , matchHeaders = []
+      }
+
 
 getEnvVarWithDefault :: Text -> Text -> IO Text
-getEnvVarWithDefault var def = do
-  varValue <- getEnv (toS var) `E.catchIOError` const (return $ toS def)
-  return $ toS varValue
+getEnvVarWithDefault var def = toS <$>
+  getEnv (toS var) `E.catchIOError` const (return $ toS def)
 
 _baseCfg :: AppConfig
 _baseCfg =  -- Connection Settings
   AppConfig mempty "postgrest_test_anonymous" Nothing "test" "localhost" 3000
+            -- No user configured Unix Socket
+            Nothing
             -- Jwt settings
             (Just $ encodeUtf8 "reallyreallyreallyreallyverysafe") False Nothing
             -- Connection Modifiers
-            10 Nothing (Just "test.switch_role")
+            10 10 Nothing (Just "test.switch_role")
             -- Debug Settings
             True
             [ ("app.settings.app_host", "localhost")
             , ("app.settings.external_api_secret", "0123456789abcdef")
             ]
+            -- Default role claim key
+            (Right [JSPKey "role"])
+            -- Empty db-extra-search-path
+            []
+            -- No root spec override
+            Nothing
+            -- Raw output media types
+            []
 
 testCfg :: Text -> AppConfig
 testCfg testDbConn = _baseCfg { configDatabase = testDbConn }
@@ -111,8 +118,23 @@ testCfgAsymJWK testDbConn = (testCfg testDbConn) {
       [str|{"alg":"RS256","e":"AQAB","key_ops":["verify"],"kty":"RSA","n":"0etQ2Tg187jb04MWfpuogYGV75IFrQQBxQaGH75eq_FpbkyoLcEpRUEWSbECP2eeFya2yZ9vIO5ScD-lPmovePk4Aa4SzZ8jdjhmAbNykleRPCxMg0481kz6PQhnHRUv3nF5WP479CnObJKqTVdEagVL66oxnX9VhZG9IZA7k0Th5PfKQwrKGyUeTGczpOjaPqbxlunP73j9AfnAt4XCS8epa-n3WGz1j-wfpr_ys57Aq-zBCfqP67UYzNpeI1AoXsJhD9xSDOzvJgFRvc3vm2wjAW4LEMwi48rCplamOpZToIHEPIaPzpveYQwDnB1HFTR1ove9bpKJsHmi-e2uzQ","use":"sig"}|]
   }
 
+testCfgAsymJWKSet :: Text -> AppConfig
+testCfgAsymJWKSet testDbConn = (testCfg testDbConn) {
+    configJwtSecret = Just $ encodeUtf8
+      [str|{"keys": [{"alg":"RS256","e":"AQAB","key_ops":["verify"],"kty":"RSA","n":"0etQ2Tg187jb04MWfpuogYGV75IFrQQBxQaGH75eq_FpbkyoLcEpRUEWSbECP2eeFya2yZ9vIO5ScD-lPmovePk4Aa4SzZ8jdjhmAbNykleRPCxMg0481kz6PQhnHRUv3nF5WP479CnObJKqTVdEagVL66oxnX9VhZG9IZA7k0Th5PfKQwrKGyUeTGczpOjaPqbxlunP73j9AfnAt4XCS8epa-n3WGz1j-wfpr_ys57Aq-zBCfqP67UYzNpeI1AoXsJhD9xSDOzvJgFRvc3vm2wjAW4LEMwi48rCplamOpZToIHEPIaPzpveYQwDnB1HFTR1ove9bpKJsHmi-e2uzQ","use":"sig"}]}|]
+  }
+
 testNonexistentSchemaCfg :: Text -> AppConfig
 testNonexistentSchemaCfg testDbConn = (testCfg testDbConn) { configSchema = "nonexistent" }
+
+testCfgExtraSearchPath :: Text -> AppConfig
+testCfgExtraSearchPath testDbConn = (testCfg testDbConn) { configExtraSearchPath = ["public", "extensions"] }
+
+testCfgRootSpec :: Text -> AppConfig
+testCfgRootSpec testDbConn = (testCfg testDbConn) { configRootSpec = Just $ QualifiedIdentifier "test" "root"}
+
+testCfgHtmlRawOutput :: Text -> AppConfig
+testCfgHtmlRawOutput testDbConn = (testCfg testDbConn) { configRawMediaTypes = ["text/html"] }
 
 setupDb :: Text -> IO ()
 setupDb dbConn = do
@@ -120,6 +142,7 @@ setupDb dbConn = do
   loadFixture dbConn "roles"
   loadFixture dbConn "schema"
   loadFixture dbConn "jwt"
+  loadFixture dbConn "jsonschema"
   loadFixture dbConn "privileges"
   resetDb dbConn
 
@@ -128,7 +151,7 @@ resetDb dbConn = loadFixture dbConn "data"
 
 loadFixture :: Text -> FilePath -> IO()
 loadFixture dbConn name =
-  void $ readProcess "psql" [toS dbConn, "-a", "-f", "test/fixtures/" ++ name ++ ".sql"] []
+  void $ readProcess "psql" ["--set", "ON_ERROR_STOP=1", toS dbConn, "-a", "-f", "test/fixtures/" ++ name ++ ".sql"] []
 
 rangeHdrs :: ByteRange -> [Header]
 rangeHdrs r = [rangeUnit, (hRange, renderByteRange r)]
@@ -163,5 +186,5 @@ isErrorFormat s =
     S.null (S.difference keys validKeys)
  where
   obj = decode s :: Maybe (M.Map Text Value)
-  keys = fromMaybe S.empty (M.keysSet <$> obj)
+  keys = maybe S.empty M.keysSet obj
   validKeys = S.fromList ["message", "details", "hint", "code"]

@@ -1,5 +1,3 @@
-{-# LANGUAGE LambdaCase, TemplateHaskell #-}
-{-# OPTIONS_GHC -fno-warn-type-defaults #-}
 {-|
 Module      : PostgREST.Config
 Description : Manages PostgREST configuration options.
@@ -14,51 +12,57 @@ turned in configurable behaviour if needed.
 
 Other hardcoded options such as the minimum version number also belong here.
 -}
+{-# LANGUAGE LambdaCase          #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell     #-}
+{-# OPTIONS_GHC -fno-warn-type-defaults #-}
+
 module PostgREST.Config ( prettyVersion
                         , docsVersion
                         , readOptions
                         , corsPolicy
-                        , minimumPgVersion
-                        , pgVersion95
-                        , pgVersion96
                         , AppConfig (..)
+                        , configPoolTimeout'
                         )
        where
 
-import           PostgREST.Types             (PgVersion(..))
-import           Control.Applicative
-import           Control.Monad                (fail)
-import           Control.Lens                 (preview)
-import           Crypto.JWT                   (StringOrURI,
-                                               stringOrUri)
 import qualified Data.ByteString              as B
 import qualified Data.ByteString.Char8        as BS
 import qualified Data.CaseInsensitive         as CI
 import qualified Data.Configurator            as C
-import qualified Data.Configurator.Parser     as C
-import           Data.Configurator.Types      as C
-import           Data.List                    (lookup)
-import           Data.Monoid
-import           Data.Scientific              (floatingOrInteger)
-import           Data.String                  (String)
-import           Data.Text                    (dropAround,
-                                               intercalate, lines,
-                                               strip, take)
-import           Data.Text.Encoding           (encodeUtf8)
-import           Data.Text.IO                 (hPutStrLn)
-import           Data.Version                 (versionBranch)
-import           Development.GitRev           (gitHash)
-import           Network.Wai
-import           Network.Wai.Middleware.Cors  (CorsResourcePolicy (..))
-import           Options.Applicative          hiding (str)
-import           Paths_postgrest              (version)
-import           Protolude                    hiding (hPutStrLn, take,
-                                               intercalate, (<>))
-import           System.IO                    (hPrint)
-import           System.IO.Error              (IOError)
-import           Text.Heredoc
-import           Text.PrettyPrint.ANSI.Leijen hiding ((<$>), (<>))
 import qualified Text.PrettyPrint.ANSI.Leijen as L
+
+import Control.Exception           (Handler (..))
+import Control.Lens                (preview)
+import Control.Monad               (fail)
+import Crypto.JWT                  (StringOrURI, stringOrUri)
+import Data.List                   (lookup)
+import Data.Scientific             (floatingOrInteger)
+import Data.Text                   (dropEnd, dropWhileEnd,
+                                    intercalate, lines, splitOn,
+                                    strip, take, unpack)
+import Data.Text.Encoding          (encodeUtf8)
+import Data.Text.IO                (hPutStrLn)
+import Data.Version                (versionBranch)
+import Development.GitRev          (gitHash)
+import Network.Wai.Middleware.Cors (CorsResourcePolicy (..))
+import Paths_postgrest             (version)
+import System.IO.Error             (IOError)
+
+import Control.Applicative
+import Data.Monoid
+import Network.Wai
+import Options.Applicative          hiding (str)
+import Text.Heredoc
+import Text.PrettyPrint.ANSI.Leijen hiding ((<$>), (<>))
+
+import PostgREST.Error   (ApiRequestError (..))
+import PostgREST.Parsers (pRoleClaimKey)
+import PostgREST.Types   (JSPath, JSPathExp (..),
+                          QualifiedIdentifier (..))
+import Protolude         hiding (concat, hPutStrLn, intercalate, null,
+                          take, (<>))
+
 
 -- | Config file settings for the server
 data AppConfig = AppConfig {
@@ -68,21 +72,33 @@ data AppConfig = AppConfig {
   , configSchema            :: Text
   , configHost              :: Text
   , configPort              :: Int
+  , configSocket            :: Maybe Text
 
   , configJwtSecret         :: Maybe B.ByteString
   , configJwtSecretIsBase64 :: Bool
   , configJwtAudience       :: Maybe StringOrURI
 
   , configPool              :: Int
+  , configPoolTimeout       :: Int
   , configMaxRows           :: Maybe Integer
   , configReqCheck          :: Maybe Text
   , configQuiet             :: Bool
   , configSettings          :: [(Text, Text)]
+  , configRoleClaimKey      :: Either ApiRequestError JSPath
+  , configExtraSearchPath   :: [Text]
+
+  , configRootSpec          :: Maybe QualifiedIdentifier
+  , configRawMediaTypes     :: [B.ByteString]
   }
+
+configPoolTimeout' :: (Fractional a) => AppConfig -> a
+configPoolTimeout' =
+  fromRational . toRational . configPoolTimeout
+
 
 defaultCorsPolicy :: CorsResourcePolicy
 defaultCorsPolicy =  CorsResourcePolicy Nothing
-  ["GET", "POST", "PATCH", "DELETE", "OPTIONS"] ["Authorization"] Nothing
+  ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"] ["Authorization"] Nothing
   (Just $ 60*60*24) False False True
 
 -- | CORS policy to be used in by Wai Cors middleware
@@ -111,7 +127,7 @@ prettyVersion =
 
 -- | Version number used in docs
 docsVersion :: Text
-docsVersion = "v" <> dropAround (== '.') (dropAround (/= '.') prettyVersion)
+docsVersion = "v" <> dropEnd 1 (dropWhileEnd (/= '.') prettyVersion)
 
 -- | Function to read and parse options from the command line
 readOptions :: IO AppConfig
@@ -119,60 +135,87 @@ readOptions = do
   -- First read the config file path from command line
   cfgPath <- customExecParser parserPrefs opts
   -- Now read the actual config file
-  conf <- catch
-    (C.readConfig =<< C.load [C.Required cfgPath])
-    configNotfoundHint
+  conf <- catches (C.load cfgPath)
+    [ Handler (\(ex :: IOError)    -> exitErr $ "Cannot open config file:\n\t" <> show ex)
+    , Handler (\(C.ParseError err) -> exitErr $ "Error parsing config file:\n\t" <> err)
+    ]
 
-  let (mAppConf, errs) = flip C.runParserM conf $
-        AppConfig
-          <$> C.key "db-uri"
-          <*> C.key "db-anon-role"
-          <*> (mfilter (/= "") <$> C.key "server-proxy-uri")
-          <*> C.key "db-schema"
-          <*> (fromMaybe "*4" . mfilter (/= "") <$> C.key "server-host")
-          <*> (fromMaybe 3000 . join . fmap coerceInt <$> C.key "server-port")
-          <*> (fmap encodeUtf8 . mfilter (/= "") <$> C.key "jwt-secret")
-          <*> (fromMaybe False . join . fmap coerceBool <$> C.key "secret-is-base64")
-          <*> parseJwtAudience "jwt-aud"
-          <*> (fromMaybe 10 . join . fmap coerceInt <$> C.key "db-pool")
-          <*> (join . fmap coerceInt <$> C.key "max-rows")
-          <*> (mfilter (/= "") <$> C.key "pre-request")
-          <*> pure False
-          <*> (fmap parsedPairToTextPair <$> C.subassocs "app.settings")
-
-  case mAppConf of
-    Nothing -> do
-      forM_ errs $ hPrint stderr
-      exitFailure
-    Just appConf ->
+  case C.runParser parseConfig conf of
+    Left err ->
+      exitErr $ "Error parsing config file:\n\t" <> err
+    Right appConf ->
       return appConf
 
   where
-    parsedPairToTextPair :: (Name, Value) -> (Text, Text)
-    parsedPairToTextPair (k, v) = (k, newValue)
-      where
-        newValue = case v of
-          String textVal -> textVal
-          _ -> show v
+    dbSchema = reqString "db-schema"
+    parseConfig =
+      AppConfig
+        <$> reqString "db-uri"
+        <*> reqString "db-anon-role"
+        <*> optString "server-proxy-uri"
+        <*> dbSchema
+        <*> (fromMaybe "!4" <$> optString "server-host")
+        <*> (fromMaybe 3000 <$> optInt "server-port")
+        <*> optString "server-unix-socket"
+        <*> (fmap encodeUtf8 <$> optString "jwt-secret")
+        <*> (fromMaybe False <$> optBool "secret-is-base64")
+        <*> parseJwtAudience "jwt-aud"
+        <*> (fromMaybe 10 <$> optInt "db-pool")
+        <*> (fromMaybe 10 <$> optInt "db-pool-timeout")
+        <*> optInt "max-rows"
+        <*> optString "pre-request"
+        <*> pure False
+        <*> (fmap (fmap coerceText) <$> C.subassocs "app.settings" C.value)
+        <*> (maybe (Right [JSPKey "role"]) parseRoleClaimKey <$> optValue "role-claim-key")
+        <*> (maybe ["public"] splitOnCommas <$> optValue "db-extra-search-path")
+        <*> ((\x y -> QualifiedIdentifier x <$> y) <$> dbSchema <*> optString "root-spec")
+        <*> (maybe [] (fmap encodeUtf8 . splitOnCommas) <$> optValue "raw-media-types")
 
-    parseJwtAudience :: Name -> C.ConfigParserM (Maybe StringOrURI)
+    parseJwtAudience :: C.Key -> C.Parser C.Config (Maybe StringOrURI)
     parseJwtAudience k =
-      C.key k >>= \case
+      C.optional k C.string >>= \case
         Nothing -> pure Nothing -- no audience in config file
-        Just aud -> case preview stringOrUri (aud :: String) of
+        Just aud -> case preview stringOrUri (unpack aud) of
           Nothing -> fail "Invalid Jwt audience. Check your configuration."
           (Just "") -> pure Nothing
           aud' -> pure aud'
 
-    coerceInt :: (Read i, Integral i) => Value -> Maybe i
-    coerceInt (Number x) = rightToMaybe $ floatingOrInteger x
-    coerceInt (String x) = readMaybe $ toS x
-    coerceInt _          = Nothing
+    reqString :: C.Key -> C.Parser C.Config Text
+    reqString k = C.required k C.string
 
-    coerceBool :: Value -> Maybe Bool
-    coerceBool (Bool b)   = Just b
-    coerceBool (String b) = readMaybe $ toS b
-    coerceBool _          = Nothing
+    optString :: C.Key -> C.Parser C.Config (Maybe Text)
+    optString k = mfilter (/= "") <$> C.optional k C.string
+
+    optValue :: C.Key -> C.Parser C.Config (Maybe C.Value)
+    optValue k = C.optional k C.value
+
+    optInt :: (Read i, Integral i) => C.Key -> C.Parser C.Config (Maybe i)
+    optInt k = join <$> C.optional k (coerceInt <$> C.value)
+
+    optBool :: C.Key -> C.Parser C.Config (Maybe Bool)
+    optBool k = join <$> C.optional k (coerceBool <$> C.value)
+
+    coerceText :: C.Value -> Text
+    coerceText (C.String s) = s
+    coerceText v            = show v
+
+    coerceInt :: (Read i, Integral i) => C.Value -> Maybe i
+    coerceInt (C.Number x) = rightToMaybe $ floatingOrInteger x
+    coerceInt (C.String x) = readMaybe $ toS x
+    coerceInt _            = Nothing
+
+    coerceBool :: C.Value -> Maybe Bool
+    coerceBool (C.Bool b)   = Just b
+    coerceBool (C.String b) = readMaybe $ toS b
+    coerceBool _            = Nothing
+
+    parseRoleClaimKey :: C.Value -> Either ApiRequestError JSPath
+    parseRoleClaimKey (C.String s) = pRoleClaimKey s
+    parseRoleClaimKey v            = pRoleClaimKey $ show v
+
+    splitOnCommas :: C.Value -> [Text]
+    splitOnCommas (C.String s) = strip <$> splitOn "," s
+    splitOnCommas _            = []
 
     opts = info (helper <*> pathParser) $
              fullDesc
@@ -188,26 +231,30 @@ readOptions = do
 
     parserPrefs = prefs showHelpOnError
 
-    configNotfoundHint :: IOError -> IO a
-    configNotfoundHint e = do
-      hPutStrLn stderr $
-        "Cannot open config file:\n\t" <> show e
+    exitErr :: Text -> IO a
+    exitErr err = do
+      hPutStrLn stderr err
       exitFailure
 
     exampleCfg :: Doc
     exampleCfg = vsep . map (text . toS) . lines $
       [str|db-uri = "postgres://user:pass@localhost:5432/dbname"
-          |db-schema = "public"
+          |db-schema = "public" # this schema gets added to the search_path of every request
           |db-anon-role = "postgres"
           |db-pool = 10
+          |db-pool-timeout = 10
           |
-          |server-host = "*4"
+          |server-host = "!4"
           |server-port = 3000
+          |
+          |## unix socket location
+          |## if specified it takes precedence over server-port
+          |# server-unix-socket = "/tmp/pgrst.sock"
           |
           |## base url for swagger output
           |# server-proxy-uri = ""
           |
-          |## choose a secret to enable JWT auth
+          |## choose a secret, JSON Web Key (or set) to enable JWT auth
           |## (use "@filename" to load from separate file)
           |# jwt-secret = "foo"
           |# secret-is-base64 = false
@@ -218,6 +265,19 @@ readOptions = do
           |
           |## stored proc to exec immediately after auth
           |# pre-request = "stored_proc_name"
+          |
+          |## jspath to the role claim key
+          |# role-claim-key = ".role"
+          |
+          |## extra schemas to add to the search_path of every request
+          |# db-extra-search-path = "extensions, util"
+          |
+          |## stored proc that overrides the root "/" spec
+          |## it must be inside the db-schema
+          |# root-spec = "stored_proc_name"
+          |
+          |## content types to produce raw output
+          |# raw-media-types="image/png, image/jpg"
           |]
 
 pathParser :: Parser FilePath
@@ -225,13 +285,3 @@ pathParser =
   strArgument $
     metavar "FILENAME" <>
     help "Path to configuration file"
-
--- | Tells the minimum PostgreSQL version required by this version of PostgREST
-minimumPgVersion :: PgVersion
-minimumPgVersion = PgVersion 90400 "9.4"
-
-pgVersion96 :: PgVersion
-pgVersion96 = PgVersion 90600 "9.6"
-
-pgVersion95 :: PgVersion
-pgVersion95 = PgVersion 90500 "9.5"

@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE LambdaCase       #-}
 {-|
 Module      : PostgREST.Auth
 Description : PostgREST authorization functions.
@@ -15,42 +16,67 @@ module PostgREST.Auth (
     containsRole
   , jwtClaims
   , JWTAttempt(..)
-  , parseJWK
+  , parseSecret
   ) where
 
-import           Control.Lens.Operators
-import           Data.Aeson             (Value (..), decode, toJSON)
-import qualified Data.HashMap.Strict    as M
-import           Protolude
+import qualified Crypto.JOSE.Types   as JOSE.Types
+import qualified Data.Aeson          as JSON
+import qualified Data.HashMap.Strict as M
+import           Data.Vector         as V
 
-import qualified Crypto.JOSE.Types      as JOSE.Types
-import           Crypto.JWT
+import Control.Lens    (set)
+import Data.Time.Clock (UTCTime)
+
+import Control.Lens.Operators
+import Crypto.JWT
+
+import PostgREST.Types
+import Protolude
 
 {-|
   Possible situations encountered with client JWTs
 -}
 data JWTAttempt = JWTInvalid JWTError
                 | JWTMissingSecret
-                | JWTClaims (M.HashMap Text Value)
+                | JWTClaims (M.HashMap Text JSON.Value)
                 deriving (Eq, Show)
 
 {-|
   Receives the JWT secret and audience (from config) and a JWT and returns a map
   of JWT claims.
 -}
-jwtClaims :: Maybe JWK -> Maybe StringOrURI -> LByteString  -> IO JWTAttempt
-jwtClaims _ _ "" = return $ JWTClaims M.empty
-jwtClaims secret audience payload =
+jwtClaims :: Maybe JWKSet -> Maybe StringOrURI -> LByteString -> UTCTime -> Maybe JSPath -> IO JWTAttempt
+jwtClaims _ _ "" _ _ = return $ JWTClaims M.empty
+jwtClaims secret audience payload time jspath =
   case secret of
     Nothing -> return JWTMissingSecret
     Just s -> do
-      let validation = defaultJWTValidationSettings (maybe (const True) (==) audience)
+      let validation = set allowedSkew 1 $ defaultJWTValidationSettings (maybe (const True) (==) audience)
       eJwt <- runExceptT $ do
         jwt <- decodeCompact payload
-        verifyClaims validation s jwt
+        verifyClaimsAt validation s time jwt
       return $ case eJwt of
         Left e    -> JWTInvalid e
-        Right jwt -> JWTClaims . claims2map $ jwt
+        Right jwt -> JWTClaims $ claims2map jwt jspath
+
+{-|
+  Turn JWT ClaimSet into something easier to work with,
+  also here the jspath is applied to put the "role" in the map
+-}
+claims2map :: ClaimsSet -> Maybe JSPath -> M.HashMap Text JSON.Value
+claims2map claims jspath = (\case
+    val@(JSON.Object o) ->
+      let role = maybe M.empty (M.singleton "role") $
+                 walkJSPath (Just val) =<< jspath in
+      M.delete "role" o `M.union` role -- mutating the map
+    _ -> M.empty
+  ) $ JSON.toJSON claims
+
+walkJSPath :: Maybe JSON.Value -> JSPath -> Maybe JSON.Value
+walkJSPath x                      []                = x
+walkJSPath (Just (JSON.Object o)) (JSPKey key:rest) = walkJSPath (M.lookup key o) rest
+walkJSPath (Just (JSON.Array ar)) (JSPIdx idx:rest) = walkJSPath (ar V.!? idx) rest
+walkJSPath _                      _                 = Nothing
 
 {-|
   Whether a response from jwtClaims contains a role claim
@@ -60,28 +86,28 @@ containsRole (JWTClaims claims) = M.member "role" claims
 containsRole _                  = False
 
 {-|
-  Internal helper used to turn JWT ClaimSet into something
-  easier to work with
--}
-claims2map :: ClaimsSet -> M.HashMap Text Value
-claims2map = val2map . toJSON
- where
-  val2map (Object o) = o
-  val2map _          = M.empty
+  Parse `jwt-secret` configuration option and turn into a JWKSet.
 
-parseJWK :: ByteString -> JWK
-parseJWK str =
-  fromMaybe (hs256jwk str) (decode (toS str) :: Maybe JWK)
+  There are three ways to specify `jwt-secret`: text secret, JSON Web Key
+  (JWK), or JSON Web Key Set (JWKS). The first two are converted into a JWKSet
+  with one key and the last is converted as is.
+-}
+parseSecret :: ByteString -> JWKSet
+parseSecret str =
+  fromMaybe (maybe secret (\jwk' -> JWKSet [jwk']) maybeJWK)
+    maybeJWKSet
+ where
+  maybeJWKSet = JSON.decode (toS str) :: Maybe JWKSet
+  maybeJWK = JSON.decode (toS str) :: Maybe JWK
+  secret = JWKSet [jwkFromSecret str]
 
 {-|
-  Internal helper to generate HMAC-SHA256. When the jwt key in the
-  config file is a simple string rather than a JWK object, we'll
-  apply this function to it.
+  Internal helper to generate a symmetric HMAC-SHA256 JWK from a text secret.
 -}
-hs256jwk :: ByteString -> JWK
-hs256jwk key =
+jwkFromSecret :: ByteString -> JWK
+jwkFromSecret key =
   fromKeyMaterial km
-    & jwkUse .~ Just Sig
-    & jwkAlg .~ (Just $ JWSAlg HS256)
+    & jwkUse ?~ Sig
+    & jwkAlg ?~ JWSAlg HS256
  where
   km = OctKeyMaterial (OctKeyParameters (JOSE.Types.Base64Octets key))

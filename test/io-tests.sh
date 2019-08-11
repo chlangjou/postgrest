@@ -40,9 +40,10 @@ pgrStopAll(){ pkill -f "$(stack path --local-install-root)/bin/postgrest"; }
 rootStatus(){
   curl -s -o /dev/null -w '%{http_code}' "http://localhost:$pgrPort/"
 }
+
 authorsStatus(){
   curl -s -o /dev/null -w '%{http_code}' \
-    -H "Authorization: Bearer $( cat "$1" )" \
+    -H "Authorization: Bearer $1" \
     "http://localhost:$pgrPort/authors_only"
 }
 
@@ -68,15 +69,138 @@ readSecretFromFile(){
   if pgrStarted
   then
     authorsJwt="./secrets/${1%.*}.jwt"
-    httpStatus="$( authorsStatus "$authorsJwt" )"
+    httpStatus="$( authorsStatus $(cat "$authorsJwt") )"
     if test "$httpStatus" -eq 200
     then
       ok "authentication with $2 secret read from a file"
     else
-      ko "failed to authenticate using JWT for $2 secret: $httpStatus"
+      ko "authentication with $2 secret read from a file: $httpStatus"
     fi
   else
     ko "failed to read $2 secret from a file"
+  fi
+  pgrStop
+}
+
+readDbUriFromFile(){
+  pgrConfig="dburi-from-file.config"
+  pgrStartRead "./configs/$pgrConfig" "./dburis/$1"
+  while pgrStarted && test "$( rootStatus )" -ne 200
+  do
+    # wait for the server to start
+    sleep 0.1 \
+    || sleep 1 # fallback: subsecond sleep is not standard and may fail
+  done
+  if pgrStarted
+  then
+    ok "connection with $2 dburi read from a file"
+  else
+    ko "connection with $2 dburi read from a file"
+  fi
+  pgrStop
+}
+
+reqWithRoleClaimKey(){
+  export ROLE_CLAIM_KEY=$1
+  pgrStart "./configs/role-claim-key.config"
+  while pgrStarted && test "$( rootStatus )" -ne 200
+  do
+    # wait for the server to start
+    sleep 0.1 \
+    || sleep 1 # fallback: subsecond sleep is not standard and may fail
+  done
+  authorsJwt=$(psql -qtAX postgrest_test -c "select jwt.sign('$2', 'reallyreallyreallyreallyverysafe');")
+  httpStatus="$( authorsStatus "$authorsJwt" )"
+  if test "$httpStatus" -eq $3
+  then
+    ok "request with \"$1\" role-claim-key for $2 jwt: $httpStatus"
+  else
+    ko "request with \"$1\" role-claim-key for $2 jwt: $httpStatus"
+  fi
+  pgrStop
+}
+
+invalidRoleClaimKey(){
+  export ROLE_CLAIM_KEY=$1
+  pgrStart "./configs/role-claim-key.config"
+  while pgrStarted && test "$( rootStatus )" -ne 200
+  do
+    # wait for the server to start
+    sleep 0.1 \
+    || sleep 1 # fallback: subsecond sleep is not standard and may fail
+  done
+  if pgrStarted
+  then
+    ko "invalid jspath \"$1\": accepted"
+  else
+    ok "invalid jspath \"$1\": rejected"
+  fi
+  pgrStop
+}
+
+# ensure iat claim is successful in the presence of pgrst time cache, see https://github.com/PostgREST/postgrest/issues/1139
+ensureIatClaimWorks(){
+  pgrStart "./configs/simple.config"
+  while pgrStarted && test "$( rootStatus )" -ne 200
+  do
+    # wait for the server to start
+    sleep 0.1 \
+    || sleep 1 # fallback: subsecond sleep is not standard and may fail
+  done
+  for i in {1..10}; do \
+    iatJwt=$(psql -qtAX postgrest_test -c "select jwt.sign(row_to_json(r), 'reallyreallyreallyreallyverysafe') from ( select 'postgrest_test_author' as role, extract(epoch from now()) as iat) r")
+    httpStatus="$( authorsStatus $iatJwt )"
+    if test "$httpStatus" -ne 200
+    then
+      ko "iat claim rejected: $httpStatus"
+      return
+    fi
+    sleep .5;\
+  done
+  ok "iat claim accepted"
+  pgrStop
+}
+
+# ensure app settings don't reset on pool timeout of 10 seconds, see https://github.com/PostgREST/postgrest/issues/1141
+ensureAppSettings(){
+  pgrStart "./configs/app-settings.config"
+  while pgrStarted && test "$( rootStatus )" -ne 200
+  do
+    # wait for the server to start
+    sleep 0.1 \
+    || sleep 1 # fallback: subsecond sleep is not standard and may fail
+  done
+  sleep 11
+  response=$(curl -s "http://localhost:$pgrPort/rpc/get_guc_value?name=app.settings.external_api_secret")
+  if test "$response" = "\"0123456789abcdef\""
+  then
+    ok "GET /rpc/get_guc_value: $response"
+  else
+    ko "GET /rpc/get_guc_value: $response"
+  fi
+  pgrStop
+}
+
+getSocketStatus() {
+  curl -sL -w "%{http_code}\\n" -o /dev/null localhost:54321
+}
+
+socketConnection(){
+  # map port 54321 traffic to unix socket as workaround for curl below 7.40
+  # not supporting --unix-socket flag
+  ncat -vlk 54321 -c 'ncat -U /tmp/postgrest.sock' &
+  pgrStart "./configs/unix-socket.config"
+  while pgrStarted && test "$( getSocketStatus )" -ne 200
+  do
+    # wait for the server to start
+    sleep 0.1 \
+    || sleep 1 # fallback: subsecond sleep is not standard and may fail
+  done
+  if test $( getSocketStatus ) -eq 200
+  then
+    ok "Succesfully connected through unix socket"
+  else
+    ko "Failed to connect through unix socket"
   fi
   pgrStop
 }
@@ -89,8 +213,9 @@ psql -l 1>/dev/null 2>/dev/null || bailOut 'postgres is not running'
 
 setUp
 
-totalTests=12
-echo "1..$totalTests"
+echo "Running IO tests.."
+
+socketConnection
 
 readSecretFromFile word.noeol 'simple (no EOL)'
 readSecretFromFile word.txt 'simple'
@@ -105,6 +230,26 @@ readSecretFromFile word.b64 'Base64 (simple)'
 readSecretFromFile ascii.b64 'Base64 (ASCII)'
 readSecretFromFile utf8.b64 'Base64 (UTF-8)'
 readSecretFromFile binary.b64 'Base64 (binary)'
+
+readDbUriFromFile uri.noeol "(no EOL)"
+readDbUriFromFile uri.txt "(EOL)"
+
+reqWithRoleClaimKey '.postgrest.a_role' '{"postgrest":{"a_role":"postgrest_test_author"}}' 200
+reqWithRoleClaimKey '.customObject.manyRoles[1]' '{"customObject":{"manyRoles": ["other", "postgrest_test_author"]}}' 200
+reqWithRoleClaimKey '."https://www.example.com/roles"[0].value' '{"https://www.example.com/roles":[{"value":"postgrest_test_author"}]}' 200
+reqWithRoleClaimKey '.myDomain[3]' '{"myDomain":["other","postgrest_test_author"]}' 401
+reqWithRoleClaimKey '.myRole' '{"role":"postgrest_test_author"}' 401
+
+invalidRoleClaimKey 'role.other'
+invalidRoleClaimKey '.role##'
+invalidRoleClaimKey '.my_role;;domain'
+invalidRoleClaimKey '.#$%&$%/'
+invalidRoleClaimKey ''
+invalidRoleClaimKey 1234
+
+ensureIatClaimWorks
+ensureAppSettings
+
 
 cleanUp
 

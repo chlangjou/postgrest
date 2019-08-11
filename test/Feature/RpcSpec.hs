@@ -1,20 +1,24 @@
 module Feature.RpcSpec where
 
-import Test.Hspec hiding (pendingWith)
-import Test.Hspec.Wai
-import Test.Hspec.Wai.JSON
-import Network.HTTP.Types
-import Network.Wai.Test (SResponse(simpleStatus, simpleBody))
 import qualified Data.ByteString.Lazy as BL (empty)
 
-import SpecHelper
+import Network.Wai      (Application)
+import Network.Wai.Test (SResponse (simpleBody, simpleStatus))
+
+import Network.HTTP.Types
+import Test.Hspec          hiding (pendingWith)
+import Test.Hspec.Wai
+import Test.Hspec.Wai.JSON
 import Text.Heredoc
-import Network.Wai (Application)
 
-import Protolude hiding (get)
+import PostgREST.Types (PgVersion, pgVersion100, pgVersion109,
+                        pgVersion110, pgVersion112, pgVersion114,
+                        pgVersion95)
+import Protolude       hiding (get)
+import SpecHelper
 
-spec :: SpecWith Application
-spec =
+spec :: PgVersion -> SpecWith Application
+spec actualPgVersion =
   describe "remote procedure call" $ do
     context "a proc that returns a set" $ do
       it "returns paginated results" $ do
@@ -77,6 +81,31 @@ spec =
       it "should fail with 404 on unknown proc args" $ do
         get "/rpc/sayhello" `shouldRespondWith` 404
         get "/rpc/sayhello?any_arg=value" `shouldRespondWith` 404
+      it "should not ignore unknown args and fail with 404" $
+        get "/rpc/add_them?a=1&b=2&smthelse=blabla" `shouldRespondWith`
+        let
+          message :: Text
+          message
+            | actualPgVersion < pgVersion95 = "function test.add_them(a := integer, b := integer, smthelse := text) does not exist"
+            | otherwise = "function test.add_them(a => integer, b => integer, smthelse => text) does not exist"
+        in [json| {
+          "code": "42883",
+          "details": null,
+          "hint": "No function matches the given name and argument types. You might need to add explicit type casts.",
+          "message": #{message} } |]
+        { matchStatus  = 404
+        , matchHeaders = [matchContentTypeJson]
+        }
+
+    it "works when having uppercase identifiers" $ do
+      get "/rpc/quotedFunction?user=mscott&fullName=Michael Scott&SSN=401-32-XXXX" `shouldRespondWith`
+        [json|{"user": "mscott", "fullName": "Michael Scott", "SSN": "401-32-XXXX"}|]
+        { matchHeaders = [matchContentTypeJson] }
+      post "/rpc/quotedFunction"
+        [json|{"user": "dschrute", "fullName": "Dwight Schrute", "SSN": "030-18-XXXX"}|]
+        `shouldRespondWith`
+        [json|{"user": "dschrute", "fullName": "Dwight Schrute", "SSN": "030-18-XXXX"}|]
+        { matchHeaders = [matchContentTypeJson] }
 
     context "shaping the response returned by a proc" $ do
       it "returns a project" $ do
@@ -111,24 +140,24 @@ spec =
 
     context "foreign entities embedding" $ do
       it "can embed if related tables are in the exposed schema" $ do
-        post "/rpc/getproject?select=id,name,client{id},tasks{id}" [json| { "id": 1} |] `shouldRespondWith`
+        post "/rpc/getproject?select=id,name,client(id),tasks(id)" [json| { "id": 1} |] `shouldRespondWith`
           [json|[{"id":1,"name":"Windows 7","client":{"id":1},"tasks":[{"id":1},{"id":2}]}]|]
           { matchHeaders = [matchContentTypeJson] }
-        get "/rpc/getproject?id=1&select=id,name,client{id},tasks{id}" `shouldRespondWith`
+        get "/rpc/getproject?id=1&select=id,name,client(id),tasks(id)" `shouldRespondWith`
           [json|[{"id":1,"name":"Windows 7","client":{"id":1},"tasks":[{"id":1},{"id":2}]}]|]
           { matchHeaders = [matchContentTypeJson] }
 
       it "cannot embed if the related table is not in the exposed schema" $ do
-        post "/rpc/single_article?select=*,article_stars{*}" [json|{ "id": 1}|]
+        post "/rpc/single_article?select=*,article_stars(*)" [json|{ "id": 1}|]
           `shouldRespondWith` 400
-        get "/rpc/single_article?id=1&select=*,article_stars{*}"
+        get "/rpc/single_article?id=1&select=*,article_stars(*)"
           `shouldRespondWith` 400
 
       it "can embed if the related tables are in a hidden schema but exposed as views" $ do
-        post "/rpc/single_article?select=id,articleStars{userId}" [json|{ "id": 2}|]
+        post "/rpc/single_article?select=id,articleStars(userId)" [json|{ "id": 2}|]
           `shouldRespondWith` [json|[{"id": 2, "articleStars": [{"userId": 3}]}]|]
           { matchHeaders = [matchContentTypeJson] }
-        get "/rpc/single_article?id=2&select=id,articleStars{userId}"
+        get "/rpc/single_article?id=2&select=id,articleStars(userId)"
           `shouldRespondWith` [json|[{"id": 2, "articleStars": [{"userId": 3}]}]|]
           { matchHeaders = [matchContentTypeJson] }
 
@@ -203,6 +232,48 @@ spec =
           [json|null|]
           { matchHeaders = [matchContentTypeJson] }
 
+    context "proc argument types" $ do
+      it "accepts a variety of arguments" $
+        post "/rpc/varied_arguments"
+            [json| {
+              "double": 3.1,
+              "varchar": "hello",
+              "boolean": true,
+              "date": "20190101",
+              "money": 0,
+              "enum": "foo",
+              "integer": 43,
+              "json": {"some key": "some value"},
+              "jsonb": {"another key": [1, 2, "3"]}
+            } |]
+          `shouldRespondWith`
+            [json|"Hi"|]
+            { matchHeaders = [matchContentTypeJson] }
+
+      it "parses embedded JSON arguments as JSON" $
+        post "/rpc/json_argument"
+            [json| { "arg": { "key": 3 } } |]
+          `shouldRespondWith`
+            [json|"object"|]
+            { matchHeaders = [matchContentTypeJson] }
+
+      when (actualPgVersion < pgVersion100) $
+        it "parses quoted JSON arguments as JSON (Postgres < 10)" $
+          post "/rpc/json_argument"
+              [json| { "arg": "{ \"key\": 3 }" } |]
+            `shouldRespondWith`
+              [json|"object"|]
+              { matchHeaders = [matchContentTypeJson] }
+
+      when ((actualPgVersion >= pgVersion109 && actualPgVersion < pgVersion110)
+            || actualPgVersion >= pgVersion114) $
+        it "parses quoted JSON arguments as JSON string (from Postgres 10.9, 11.4)" $
+          post "/rpc/json_argument"
+              [json| { "arg": "{ \"key\": 3 }" } |]
+            `shouldRespondWith`
+              [json|"string"|]
+              { matchHeaders = [matchContentTypeJson] }
+
     context "improper input" $ do
       it "rejects unknown content type even if payload is good" $ do
         request methodPost "/rpc/sayhello"
@@ -226,7 +297,11 @@ spec =
     context "unsupported verbs" $ do
       it "DELETE fails" $
         request methodDelete "/rpc/sayhello" [] ""
-          `shouldRespondWith` 405
+          `shouldRespondWith`
+          [json|{"message":"Bad Request"}|]
+          { matchStatus  = 405
+          , matchHeaders = [matchContentTypeJson]
+          }
       it "PATCH fails" $
         request methodPatch "/rpc/sayhello" [] ""
           `shouldRespondWith` 405
@@ -292,7 +367,12 @@ spec =
         }
 
     it "defaults to status 500 if RAISE code is PT not followed by a number" $
-      get "/rpc/raise_bad_pt" `shouldRespondWith` 500
+      get "/rpc/raise_bad_pt"
+        `shouldRespondWith`
+        [json|{"hint": null, "details": null}|]
+        { matchStatus  = 500
+        , matchHeaders = [ matchContentTypeJson ]
+        }
 
     context "expects a single json object" $ do
       it "does not expand posted json into parameters" $
@@ -329,9 +409,83 @@ spec =
       get "/rpc/overloaded?a=1&b=2" `shouldRespondWith` [str|3|]
       get "/rpc/overloaded?a=1&b=2&c=3" `shouldRespondWith` [str|"123"|]
 
-    context "only for POST rpc" $
+    context "only for POST rpc" $ do
       it "gives a parse filter error if GET style proc args are specified" $
         post "/rpc/sayhello?name=John" [json|{}|] `shouldRespondWith` 400
+
+      it "ignores json keys not included in ?columns" $
+        post "/rpc/sayhello?columns=name"
+          [json|{"name": "John", "smth": "here", "other": "stuff", "fake_id": 13}|] `shouldRespondWith`
+          [json|"Hello, John"|]
+          { matchHeaders = [matchContentTypeJson] }
+
+    context "bulk RPC" $ do
+      it "works with a scalar function an returns a json array" $
+        post "/rpc/add_them"
+          [json|[
+            {"a": 1, "b": 2},
+            {"a": 4, "b": 6},
+            {"a": 100, "b": 200}
+          ]|] `shouldRespondWith`
+          [json|
+            [3, 10, 300]
+          |] { matchHeaders = [matchContentTypeJson] }
+
+      it "works with a scalar function an returns a json array when posting CSV" $
+        request methodPost "/rpc/add_them" [("Content-Type", "text/csv")]
+          "a,b\n1,2\n4,6\n100,200"
+          `shouldRespondWith`
+          [json|
+            [3, 10, 300]
+          |]
+          { matchStatus  = 200
+          , matchHeaders = [matchContentTypeJson]
+          }
+
+      it "works with a non-scalar result" $
+        post "/rpc/get_projects_below?select=id,name"
+          [json|[
+            {"id": 1},
+            {"id": 5}
+          ]|] `shouldRespondWith`
+          [json|
+            [{"id":1,"name":"Windows 7"},
+             {"id":2,"name":"Windows 10"},
+             {"id":3,"name":"IOS"},
+             {"id":4,"name":"OSX"}]
+          |] { matchHeaders = [matchContentTypeJson] }
+
+    context "binary output" $ do
+      context "Proc that returns scalar" $ do
+        it "can query without selecting column" $
+          request methodPost "/rpc/ret_base64_bin" (acceptHdrs "application/octet-stream") ""
+            `shouldRespondWith` "iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeAQMAAAAB/jzhAAAABlBMVEUAAAD/AAAb/40iAAAAP0lEQVQI12NgwAbYG2AE/wEYwQMiZB4ACQkQYZEAIgqAhAGIKLCAEQ8kgMT/P1CCEUwc4IMSzA3sUIIdCHECAGSQEkeOTUyCAAAAAElFTkSuQmCC"
+            { matchStatus = 200
+            , matchHeaders = ["Content-Type" <:> "application/octet-stream; charset=utf-8"]
+            }
+
+        it "can get raw output with Accept: text/plain" $
+          request methodGet "/rpc/welcome" (acceptHdrs "text/plain") ""
+            `shouldRespondWith` "Welcome to PostgREST"
+            { matchStatus = 200
+            , matchHeaders = ["Content-Type" <:> "text/plain; charset=utf-8"]
+            }
+
+      context "Proc that returns rows" $ do
+        it "can query if a single column is selected" $
+          request methodPost "/rpc/ret_rows_with_base64_bin?select=img" (acceptHdrs "application/octet-stream") ""
+            `shouldRespondWith` "iVBORw0KGgoAAAANSUhEUgAAAB4AAAAeAQMAAAAB/jzhAAAABlBMVEUAAAD/AAAb/40iAAAAP0lEQVQI12NgwAbYG2AE/wEYwQMiZB4ACQkQYZEAIgqAhAGIKLCAEQ8kgMT/P1CCEUwc4IMSzA3sUIIdCHECAGSQEkeOTUyCAAAAAElFTkSuQmCCiVBORw0KGgoAAAANSUhEUgAAAB4AAAAeAQMAAAAB/jzhAAAABlBMVEX///8AAP94wDzzAAAAL0lEQVQIW2NgwAb+HwARH0DEDyDxwAZEyGAhLODqHmBRzAcn5GAS///A1IF14AAA5/Adbiiz/0gAAAAASUVORK5CYII="
+            { matchStatus = 200
+            , matchHeaders = ["Content-Type" <:> "application/octet-stream; charset=utf-8"]
+            }
+
+        it "fails if a single column is not selected" $
+          request methodPost "/rpc/ret_rows_with_base64_bin" (acceptHdrs "application/octet-stream") ""
+            `shouldRespondWith`
+            [json| {"message":"application/octet-stream requested but more than one column was selected"} |]
+            { matchStatus = 406
+            , matchHeaders = [matchContentTypeJson]
+            }
 
     context "only for GET rpc" $ do
       it "should fail on mutating procs" $ do
@@ -361,10 +515,12 @@ spec =
         get "/rpc/get_tsearch?text_search_vector=not.fts(english).fun%7Crat" `shouldRespondWith`
           [json|[{"text_search_vector":"'amus':5 'fair':7 'impossibl':9 'peu':4"},{"text_search_vector":"'art':4 'spass':5 'unmog':7"}]|]
           { matchHeaders = [matchContentTypeJson] }
-        -- TODO: '@@' deprecated
-        get "/rpc/get_tsearch?text_search_vector=@@(english).impossible" `shouldRespondWith`
-          [json|[{"text_search_vector":"'fun':5 'imposs':9 'kind':3"}]|]
-          { matchHeaders = [matchContentTypeJson] }
-        get "/rpc/get_tsearch?text_search_vector=not.@@(english).fun%7Crat" `shouldRespondWith`
-          [json|[{"text_search_vector":"'amus':5 'fair':7 'impossibl':9 'peu':4"},{"text_search_vector":"'art':4 'spass':5 'unmog':7"}]|]
+        when (actualPgVersion >= pgVersion112) $
+            get "/rpc/get_tsearch?text_search_vector=wfts.impossible" `shouldRespondWith`
+                [json|[{"text_search_vector":"'fun':5 'imposs':9 'kind':3"}]|]
+                { matchHeaders = [matchContentTypeJson] }
+
+    it "should work with an argument of custom type in public schema" $
+        get "/rpc/test_arg?my_arg=something" `shouldRespondWith`
+          [json|"foobar"|]
           { matchHeaders = [matchContentTypeJson] }
