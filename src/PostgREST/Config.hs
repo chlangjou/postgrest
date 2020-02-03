@@ -46,8 +46,10 @@ import Data.Text.IO                (hPutStrLn)
 import Data.Version                (versionBranch)
 import Development.GitRev          (gitHash)
 import Network.Wai.Middleware.Cors (CorsResourcePolicy (..))
+import Numeric                     (readOct)
 import Paths_postgrest             (version)
 import System.IO.Error             (IOError)
+import System.Posix.Types          (FileMode)
 
 import Control.Applicative
 import Data.Monoid
@@ -58,21 +60,22 @@ import Text.PrettyPrint.ANSI.Leijen hiding ((<$>), (<>))
 
 import PostgREST.Error   (ApiRequestError (..))
 import PostgREST.Parsers (pRoleClaimKey)
-import PostgREST.Types   (JSPath, JSPathExp (..),
-                          QualifiedIdentifier (..))
+import PostgREST.Types   (JSPath, JSPathExp (..))
 import Protolude         hiding (concat, hPutStrLn, intercalate, null,
                           take, (<>))
+
 
 
 -- | Config file settings for the server
 data AppConfig = AppConfig {
     configDatabase          :: Text
   , configAnonRole          :: Text
-  , configProxyUri          :: Maybe Text
+  , configOpenAPIProxyUri   :: Maybe Text
   , configSchema            :: Text
   , configHost              :: Text
   , configPort              :: Int
   , configSocket            :: Maybe Text
+  , configSocketMode        :: Either Text FileMode
 
   , configJwtSecret         :: Maybe B.ByteString
   , configJwtSecretIsBase64 :: Bool
@@ -87,7 +90,7 @@ data AppConfig = AppConfig {
   , configRoleClaimKey      :: Either ApiRequestError JSPath
   , configExtraSearchPath   :: [Text]
 
-  , configRootSpec          :: Maybe QualifiedIdentifier
+  , configRootSpec          :: Maybe Text
   , configRawMediaTypes     :: [B.ByteString]
   }
 
@@ -147,16 +150,16 @@ readOptions = do
       return appConf
 
   where
-    dbSchema = reqString "db-schema"
     parseConfig =
       AppConfig
         <$> reqString "db-uri"
         <*> reqString "db-anon-role"
-        <*> optString "server-proxy-uri"
-        <*> dbSchema
+        <*> optString "openapi-server-proxy-uri"
+        <*> reqString "db-schema"
         <*> (fromMaybe "!4" <$> optString "server-host")
         <*> (fromMaybe 3000 <$> optInt "server-port")
         <*> optString "server-unix-socket"
+        <*> parseSocketFileMode "server-unix-socket-mode"
         <*> (fmap encodeUtf8 <$> optString "jwt-secret")
         <*> (fromMaybe False <$> optBool "secret-is-base64")
         <*> parseJwtAudience "jwt-aud"
@@ -168,8 +171,21 @@ readOptions = do
         <*> (fmap (fmap coerceText) <$> C.subassocs "app.settings" C.value)
         <*> (maybe (Right [JSPKey "role"]) parseRoleClaimKey <$> optValue "role-claim-key")
         <*> (maybe ["public"] splitOnCommas <$> optValue "db-extra-search-path")
-        <*> ((\x y -> QualifiedIdentifier x <$> y) <$> dbSchema <*> optString "root-spec")
+        <*> optString "root-spec"
         <*> (maybe [] (fmap encodeUtf8 . splitOnCommas) <$> optValue "raw-media-types")
+
+    parseSocketFileMode :: C.Key -> C.Parser C.Config (Either Text FileMode)
+    parseSocketFileMode k =
+      C.optional k C.string >>= \case
+        Nothing -> pure $ Right 432 -- return default 660 mode if no value was provided
+        Just fileModeText ->
+          case (readOct . unpack) fileModeText of
+            []              ->
+              pure $ Left "Invalid server-unix-socket-mode: not an octal"
+            (fileMode, _):_ ->
+              if fileMode < 384 || fileMode > 511
+                then pure $ Left "Invalid server-unix-socket-mode: needs to be between 600 and 777"
+                else pure $ Right fileMode
 
     parseJwtAudience :: C.Key -> C.Parser C.Config (Maybe StringOrURI)
     parseJwtAudience k =
@@ -250,9 +266,12 @@ readOptions = do
           |## unix socket location
           |## if specified it takes precedence over server-port
           |# server-unix-socket = "/tmp/pgrst.sock"
+          |## unix socket file mode
+          |## when none is provided, 660 is applied by default
+          |# server-unix-socket-mode = "660"
           |
           |## base url for swagger output
-          |# server-proxy-uri = ""
+          |# openapi-server-proxy-uri = ""
           |
           |## choose a secret, JSON Web Key (or set) to enable JWT auth
           |## (use "@filename" to load from separate file)

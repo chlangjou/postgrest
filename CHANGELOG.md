@@ -7,9 +7,44 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+- #1417, `Accept: application/vnd.pgrst.object+json` behavior is now enforced for POST/PATCH/DELETE regardless of `Prefer: return=representation/minimal` - @dwagin
+- #1415, Add support for user defined socket permission via `server-unix-socket-mode` config option - @Dansvidania
+- #1383, Add support for HEAD request - @steve-chavez
+- #1378, Add support for `Prefer: count=planned` and `Prefer: count=estimated` on GET /table - @steve-chavez
+- #1327, Add support for optional query parameter `on_conflict` to upsert with specified keys for POST - @ykst
+- #1430, Allow specifying the foreign key constraint name(`/source?select=fk_constraint(*)`) to disambiguate an embedding - @steve-chavez
+- #1168, Allow access to the `Authorization` header through the `request.header.authorization` GUC - @steve-chavez
+- #1435, Add `request.method` and `request.path` GUCs - @steve-chavez
+- #1088, Allow adding headers to GET/POST/PATCH/PUT/DELETE responses through the `response.headers` GUC - @steve-chavez
+- #1427, Allow overriding provided headers(Location, Content-Type, etc) through the `response.headers` GUC - @steve-chavez
+
+### Fixed
+
+- #1301, Fix self join resource embedding on PATCH - @herulume, @steve-chavez
+- #1389, Fix many to many resource embedding on RPC/PATCH - @steve-chavez
+- #1355, Allow PATCH/DELETE without `return=minimal` on tables with no select privileges - @steve-chavez
+- #1361, Fix embedding a VIEW when its source foreign key is UNIQUE - @bwbroersma
+
+### Changed
+
+- #1385, bulk RPC call now should be done by specifying a `Prefer: params=multiple-objects` header - @steve-chavez
+- #1401, resource embedding now outputs an error when multiple relationships between two tables are found - @steve-chavez
+- #1423, default Unix Socket file mode from 755 to 660 - @dwagin
+- #1430, Remove embedding with duck typed column names `GET /projects?select=client(*)`- @steve-chavez
+  + You can rename the foreign key to `client` to make this request work in the new version: `alter table projects rename constraint projects_client_id_fkey to client`
+- #1413, Change `server-proxy-uri` config option to `openapi-server-proxy-uri` - @steve-chavez
+
+## [6.0.2] - 2019-08-22
+
 ### Fixed
 
 - #1369, Change `raw-media-types` to accept a string of comma separated MIME types - @Dansvidania
+- #1368, Fix long column descriptions being truncated at 63 characters in PostgreSQL 12 - @amedeedaboville
+- #1348, Go back to converting plus "+" to space " " in querystrings by default - @steve-chavez
+
+### Deprecated
+
+- #1348, Deprecate `.` symbol for disambiguating resource embedding(added in #918). The url-safe '!' should be used instead. We refrained from using `+` as part of our syntax because it conflicts with some http clients and proxies.
 
 ## [6.0.1] - 2019-07-30
 

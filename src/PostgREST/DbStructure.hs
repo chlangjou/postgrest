@@ -40,34 +40,23 @@ import Unsafe                        (unsafeHead)
 
 import Control.Applicative
 
+import PostgREST.Private.Common
 import PostgREST.Types
 import Protolude
-
-column :: HD.Value a -> HD.Row a
-column = HD.column . HD.nonNullable
-
-nullableColumn :: HD.Value a -> HD.Row (Maybe a)
-nullableColumn = HD.column . HD.nullable
-
-element :: HD.Value a -> HD.Array a
-element = HD.element . HD.nonNullable
-
-param :: HE.Value a -> HE.Params a
-param = HE.param . HE.nonNullable
 
 getDbStructure :: Schema -> PgVersion -> HT.Transaction DbStructure
 getDbStructure schema pgVer = do
   HT.sql "set local schema ''" -- for getting the fully qualified name(schema.name) of every db object
-  tabs      <- HT.statement () allTables
-  cols      <- HT.statement schema $ allColumns tabs
-  syns      <- HT.statement schema $ allSynonyms cols pgVer
-  childRels <- HT.statement () $ allChildRelations tabs cols
-  keys      <- HT.statement () $ allPrimaryKeys tabs
-  procs     <- HT.statement schema allProcs
+  tabs    <- HT.statement () allTables
+  cols    <- HT.statement schema $ allColumns tabs
+  srcCols <- HT.statement schema $ allSourceColumns cols pgVer
+  m2oRels <- HT.statement () $ allM2ORels tabs cols
+  keys    <- HT.statement () $ allPrimaryKeys tabs
+  procs   <- HT.statement schema allProcs
 
-  let rels = addManyToManyRelations . addParentRelations $ addViewChildRelations syns childRels
+  let rels = addM2MRels . addO2MRels $ addViewM2ORels srcCols m2oRels
       cols' = addForeignKeys rels cols
-      keys' = addViewPrimaryKeys syns keys
+      keys' = addViewPrimaryKeys srcCols keys
 
   return DbStructure {
       dbTables = tabs
@@ -102,12 +91,13 @@ decodeColumns tables =
       <*> nullableColumn HD.text
       <*> nullableColumn HD.text
 
-decodeRelations :: [Table] -> [Column] -> HD.Result [Relation]
-decodeRelations tables cols =
-  mapMaybe (relationFromRow tables cols) <$> HD.rowList relRow
+decodeRels :: [Table] -> [Column] -> HD.Result [Relation]
+decodeRels tables cols =
+  mapMaybe (relFromRow tables cols) <$> HD.rowList relRow
  where
-  relRow = (,,,,,)
+  relRow = (,,,,,,)
     <$> column HD.text
+    <*> column HD.text
     <*> column HD.text
     <*> column (HD.array (HD.dimension replicateM (element HD.text)))
     <*> column HD.text
@@ -120,14 +110,21 @@ decodePks tables =
  where
   pkRow = (,,) <$> column HD.text <*> column HD.text <*> column HD.text
 
-decodeSynonyms :: [Column] -> HD.Result [Synonym]
-decodeSynonyms cols =
-  mapMaybe (synonymFromRow cols) <$> HD.rowList synRow
+decodeSourceColumns :: [Column] -> HD.Result [SourceColumn]
+decodeSourceColumns cols =
+  mapMaybe (sourceColumnFromRow cols) <$> HD.rowList srcColRow
  where
-  synRow = (,,,,,)
+  srcColRow = (,,,,,)
     <$> column HD.text <*> column HD.text
     <*> column HD.text <*> column HD.text
     <*> column HD.text <*> column HD.text
+
+sourceColumnFromRow :: [Column] -> (Text,Text,Text,Text,Text,Text) -> Maybe SourceColumn
+sourceColumnFromRow allCols (s1,t1,c1,s2,t2,c2) = (,) <$> col1 <*> col2
+  where
+    col1 = findCol s1 t1 c1
+    col2 = findCol s2 t2 c2
+    findCol s t c = find (\col -> (tableSchema . colTable) col == s && (tableName . colTable) col == t && colName col == c) allCols
 
 decodeProcs :: HD.Result (M.HashMap Text [ProcDescription])
 decodeProcs =
@@ -254,20 +251,20 @@ addForeignKeys rels = map addFk
     addFk col = col { colFK = fk col }
     fk col = find (lookupFn col) rels >>= relToFk col
     lookupFn :: Column -> Relation -> Bool
-    lookupFn c Relation{relColumns=cs, relType=rty} = c `elem` cs && rty==Child
+    lookupFn c Relation{relColumns=cs, relType=rty} = c `elem` cs && rty==M2O
     relToFk col Relation{relColumns=cols, relFColumns=colsF} = do
       pos <- L.elemIndex col cols
       colF <- atMay colsF pos
       return $ ForeignKey colF
 
 {-
-Adds Views Child Relations based on Synonyms found, the logic is as follows:
+Adds Views M2O Relations based on SourceColumns found, the logic is as follows:
 
-Having a Relation{relTable=t1, relColumns=[c1], relFTable=t2, relFColumns=[c2], relType=Child} represented by:
+Having a Relation{relTable=t1, relColumns=[c1], relFTable=t2, relFColumns=[c2], relType=M2O} represented by:
 
 t1.c1------t2.c2
 
-When only having a t1_view.c1 synonym, we need to add a View to Table Child Relation
+When only having a t1_view.c1 source column, we need to add a View-Table M2O Relation
 
          t1.c1----t2.c2         t1.c1----------t2.c2
                          ->            ________/
@@ -275,70 +272,72 @@ When only having a t1_view.c1 synonym, we need to add a View to Table Child Rela
       t1_view.c1             t1_view.c1
 
 
-When only having a t2_view.c2 synonym, we need to add a Table to View Child Relation
+When only having a t2_view.c2 source column, we need to add a Table-View M2O Relation
 
          t1.c1----t2.c2               t1.c1----------t2.c2
                                ->          \________
                                                     \
                     t2_view.c2                      t2_view.c1
 
-When having t1_view.c1 and a t2_view.c2 synonyms, we need to add a View to View Child Relation in addition to the prior
+When having t1_view.c1 and a t2_view.c2 source columns, we need to add a View-View M2O Relation in addition to the prior
 
          t1.c1----t2.c2               t1.c1----------t2.c2
                                ->          \________/
                                            /        \
     t1_view.c1     t2_view.c2     t1_view.c1-------t2_view.c1
 
-The logic for composite pks is similar just need to make sure all the Relation columns have synonyms.
+The logic for composite pks is similar just need to make sure all the Relation columns have source columns.
 -}
-addViewChildRelations :: [Synonym] -> [Relation] -> [Relation]
-addViewChildRelations allSyns = concatMap (\rel ->
+addViewM2ORels :: [SourceColumn] -> [Relation] -> [Relation]
+addViewM2ORels allSrcCols = concatMap (\rel ->
   rel : case rel of
-    Relation{relType=Child, relTable, relColumns, relFTable, relFColumns} ->
+    Relation{relType=M2O, relTable, relColumns, relConstraint, relFTable, relFColumns} ->
 
-      let colSynsGroupedByView :: [Column] -> [[Synonym]]
-          colSynsGroupedByView relCols = L.groupBy (\(_, viewCol1) (_, viewCol2) -> colTable viewCol1 == colTable viewCol2) $
-                                         filter (\(c, _) -> c `elem` relCols) allSyns
-          colsSyns = colSynsGroupedByView relColumns
-          fColsSyns = colSynsGroupedByView relFColumns
-          getView :: [Synonym] -> Table
+      let srcColsGroupedByView :: [Column] -> [[SourceColumn]]
+          srcColsGroupedByView relCols = L.groupBy (\(_, viewCol1) (_, viewCol2) -> colTable viewCol1 == colTable viewCol2) $
+                                         filter (\(c, _) -> c `elem` relCols) allSrcCols
+          relSrcCols = srcColsGroupedByView relColumns
+          relFSrcCols = srcColsGroupedByView relFColumns
+          getView :: [SourceColumn] -> Table
           getView = colTable . snd . unsafeHead
-          syns `allSynsOf` cols = S.fromList (fst <$> syns) == S.fromList cols
+          srcCols `allSrcColsOf` cols = S.fromList (fst <$> srcCols) == S.fromList cols
           -- Relation is dependent on the order of relColumns and relFColumns to get the join conditions right in the generated query.
-          -- So we need to change the order of the synonyms to match the relColumns
-          -- This could be avoided if the Relation type is improved with a structure that maintains the association of relColumns and relFColumns
-          syns `sortAccordingTo` columns = sortOn (\(k, _) -> L.lookup k $ zip columns [0::Int ..]) syns
+          -- So we need to change the order of the SourceColumns to match the relColumns
+          -- TODO: This could be avoided if the Relation type is improved with a structure that maintains the association of relColumns and relFColumns
+          srcCols `sortAccordingTo` cols = sortOn (\(k, _) -> L.lookup k $ zip cols [0::Int ..]) srcCols
 
-          viewTableChild =
-            [ Relation (getView syns) (snd <$> syns `sortAccordingTo` relColumns)
-                       relFTable relFColumns
-                       Child Nothing Nothing Nothing
-            | syns <- colsSyns, syns `allSynsOf` relColumns ]
+          viewTableM2O =
+            [ Relation (getView srcCols) (snd <$> srcCols `sortAccordingTo` relColumns)
+                       relConstraint relFTable relFColumns
+                       M2O Nothing
+            | srcCols <- relSrcCols, srcCols `allSrcColsOf` relColumns ]
 
-          tableViewChild =
+          tableViewM2O =
             [ Relation relTable relColumns
-                       (getView fSyns) (snd <$> fSyns `sortAccordingTo` relFColumns)
-                       Child Nothing Nothing Nothing
-            | fSyns <- fColsSyns, fSyns `allSynsOf` relFColumns ]
+                       relConstraint
+                       (getView fSrcCols) (snd <$> fSrcCols `sortAccordingTo` relFColumns)
+                       M2O Nothing
+            | fSrcCols <- relFSrcCols, fSrcCols `allSrcColsOf` relFColumns ]
 
-          viewViewChild =
-            [ Relation (getView syns) (snd <$> syns `sortAccordingTo` relColumns)
-                       (getView fSyns) (snd <$> fSyns `sortAccordingTo` relFColumns)
-                       Child Nothing Nothing Nothing
-            | syns <- colsSyns, syns `allSynsOf` relColumns
-            , fSyns <- fColsSyns, fSyns `allSynsOf` relFColumns ]
+          viewViewM2O =
+            [ Relation (getView srcCols) (snd <$> srcCols `sortAccordingTo` relColumns)
+                       relConstraint
+                       (getView fSrcCols) (snd <$> fSrcCols `sortAccordingTo` relFColumns)
+                       M2O Nothing
+            | srcCols  <- relSrcCols, srcCols `allSrcColsOf` relColumns
+            , fSrcCols <- relFSrcCols, fSrcCols `allSrcColsOf` relFColumns ]
 
-      in viewTableChild ++ tableViewChild ++ viewViewChild
+      in viewTableM2O ++ tableViewM2O ++ viewViewM2O
 
     _ -> [])
 
-addParentRelations :: [Relation] -> [Relation]
-addParentRelations = concatMap (\rel@(Relation t c ft fc _ _ _ _) -> [rel, Relation ft fc t c Parent Nothing Nothing Nothing])
+addO2MRels :: [Relation] -> [Relation]
+addO2MRels = concatMap (\rel@(Relation t c cn ft fc _ _) -> [rel, Relation ft fc cn t c O2M Nothing])
 
-addManyToManyRelations :: [Relation] -> [Relation]
-addManyToManyRelations rels = rels ++ addMirrorRelation (mapMaybe link2Relation links)
+addM2MRels :: [Relation] -> [Relation]
+addM2MRels rels = rels ++ addMirrorRel (mapMaybe junction2Rel junctions)
   where
-    links = join $ map (combinations 2) $ filter (not . null) $ groupWith groupFn $ filter ( (==Child). relType) rels
+    junctions = join $ map (combinations 2) $ filter (not . null) $ groupWith groupFn $ filter ( (==M2O). relType) rels
     groupFn :: Relation -> Text
     groupFn Relation{relTable=Table{tableSchema=s, tableName=t}} = s <> "_" <> t
     -- Reference : https://wiki.haskell.org/99_questions/Solutions/26
@@ -346,19 +345,20 @@ addManyToManyRelations rels = rels ++ addMirrorRelation (mapMaybe link2Relation 
     combinations 0 _  = [ [] ]
     combinations n xs = [ y:ys | y:xs' <- tails xs
                                , ys <- combinations (n-1) xs']
-    addMirrorRelation = concatMap (\rel@(Relation t c ft fc _ lt lc1 lc2) -> [rel, Relation ft fc t c Many lt lc2 lc1])
-    link2Relation [
-      Relation{relTable=lt, relColumns=lc1, relFTable=t,  relFColumns=c},
-      Relation{             relColumns=lc2, relFTable=ft, relFColumns=fc}
+    junction2Rel [
+      Relation{relTable=jt, relColumns=jc1, relConstraint=const1, relFTable=t,  relFColumns=c},
+      Relation{             relColumns=jc2, relConstraint=const2, relFTable=ft, relFColumns=fc}
       ]
-      | lc1 /= lc2 && length lc1 == 1 && length lc2 == 1 = Just $ Relation t c ft fc Many (Just lt) (Just lc1) (Just lc2)
+      | jc1 /= jc2 && length jc1 == 1 && length jc2 == 1 = Just $ Relation t c Nothing ft fc M2M (Just $ Junction jt const1 jc1 const2 jc2)
       | otherwise = Nothing
-    link2Relation _ = Nothing
+    junction2Rel _ = Nothing
+    addMirrorRel = concatMap (\rel@(Relation t c _ ft fc _ (Just (Junction jt const1 jc1 const2 jc2))) ->
+      [rel, Relation ft fc Nothing t c M2M (Just (Junction jt const2 jc2 const1 jc1))])
 
-addViewPrimaryKeys :: [Synonym] -> [PrimaryKey] -> [PrimaryKey]
-addViewPrimaryKeys syns = concatMap (\pk ->
+addViewPrimaryKeys :: [SourceColumn] -> [PrimaryKey] -> [PrimaryKey]
+addViewPrimaryKeys srcCols = concatMap (\pk ->
   let viewPks = (\(_, viewCol) -> PrimaryKey{pkTable=colTable viewCol, pkName=colName viewCol}) <$>
-                filter (\(col, _) -> colTable col == pkTable pk && colName col == pkName pk) syns in
+                filter (\(col, _) -> colTable col == pkTable pk && colName col == pkName pk) srcCols in
   pk : viewPks)
 
 allTables :: H.Statement () [Table]
@@ -404,7 +404,7 @@ allColumns tabs =
         array_to_string(enum_info.vals, ',') AS enum
     FROM (
         /*
-        -- CTE based on pg_catalog to get only Primary and Foreign key columns outside api schema
+        -- CTE based on pg_catalog to get PRIMARY/FOREIGN key and UNIQUE columns outside api schema
         */
         WITH key_columns AS (
              SELECT
@@ -420,7 +420,7 @@ allColumns tabs =
                pg_catalog.pg_class c,
                pg_catalog.pg_namespace n
              WHERE
-               r.contype IN ('f', 'p')
+               r.contype IN ('f', 'p', 'u')
                AND c.relkind IN ('r', 'v', 'f', 'm')
                AND r.conrelid = c.oid
                AND c.relnamespace = n.oid
@@ -571,39 +571,36 @@ columnFromRow tabs (s, t, n, desc, pos, nul, typ, u, l, p, d, e) = buildColumn <
     parseEnum :: Maybe Text -> [Text]
     parseEnum = maybe [] (split (==','))
 
-allChildRelations :: [Table] -> [Column] -> H.Statement () [Relation]
-allChildRelations tabs cols =
-  H.Statement sql HE.noParams (decodeRelations tabs cols) True
+allM2ORels :: [Table] -> [Column] -> H.Statement () [Relation]
+allM2ORels tabs cols =
+  H.Statement sql HE.noParams (decodeRels tabs cols) True
  where
   sql = [q|
     SELECT ns1.nspname AS table_schema,
            tab.relname AS table_name,
+           conname     AS constraint_name,
            column_info.cols AS columns,
            ns2.nspname AS foreign_table_schema,
            other.relname AS foreign_table_name,
            column_info.refs AS foreign_columns
     FROM pg_constraint,
-       LATERAL (SELECT array_agg(cols.attname) AS cols,
-                       array_agg(cols.attnum)  AS nums,
-                       array_agg(refs.attname) AS refs
-                  FROM ( SELECT unnest(conkey) AS col, unnest(confkey) AS ref) k,
-                       LATERAL (SELECT * FROM pg_attribute
-                                 WHERE attrelid = conrelid AND attnum = col)
-                            AS cols,
-                       LATERAL (SELECT * FROM pg_attribute
-                                 WHERE attrelid = confrelid AND attnum = ref)
-                            AS refs)
-            AS column_info,
-       LATERAL (SELECT * FROM pg_namespace WHERE pg_namespace.oid = connamespace) AS ns1,
-       LATERAL (SELECT * FROM pg_class WHERE pg_class.oid = conrelid) AS tab,
-       LATERAL (SELECT * FROM pg_class WHERE pg_class.oid = confrelid) AS other,
-       LATERAL (SELECT * FROM pg_namespace WHERE pg_namespace.oid = other.relnamespace) AS ns2
+    LATERAL (
+      SELECT array_agg(cols.attname) AS cols,
+                    array_agg(cols.attnum)  AS nums,
+                    array_agg(refs.attname) AS refs
+      FROM ( SELECT unnest(conkey) AS col, unnest(confkey) AS ref) k,
+      LATERAL (SELECT * FROM pg_attribute WHERE attrelid = conrelid AND attnum = col) AS cols,
+      LATERAL (SELECT * FROM pg_attribute WHERE attrelid = confrelid AND attnum = ref) AS refs) AS column_info,
+    LATERAL (SELECT * FROM pg_namespace WHERE pg_namespace.oid = connamespace) AS ns1,
+    LATERAL (SELECT * FROM pg_class WHERE pg_class.oid = conrelid) AS tab,
+    LATERAL (SELECT * FROM pg_class WHERE pg_class.oid = confrelid) AS other,
+    LATERAL (SELECT * FROM pg_namespace WHERE pg_namespace.oid = other.relnamespace) AS ns2
     WHERE confrelid != 0
     ORDER BY (conrelid, column_info.nums) |]
 
-relationFromRow :: [Table] -> [Column] -> (Text, Text, [Text], Text, Text, [Text]) -> Maybe Relation
-relationFromRow allTabs allCols (rs, rt, rcs, frs, frt, frcs) =
-  Relation <$> table <*> cols <*> tableF <*> colsF <*> pure Child <*> pure Nothing <*> pure Nothing <*> pure Nothing
+relFromRow :: [Table] -> [Column] -> (Text, Text, Text, [Text], Text, Text, [Text]) -> Maybe Relation
+relFromRow allTabs allCols (rs, rt, cn, rcs, frs, frt, frcs) =
+  Relation <$> table <*> cols <*> pure (Just cn) <*> tableF <*> colsF <*> pure M2O <*> pure Nothing
   where
     findTable s t = find (\tbl -> tableSchema tbl == s && tableName tbl == t) allTabs
     findCol s t c = find (\col -> tableSchema (colTable col) == s && tableName (colTable col) == t && colName col == c) allCols
@@ -722,9 +719,9 @@ pkFromRow :: [Table] -> (Schema, Text, Text) -> Maybe PrimaryKey
 pkFromRow tabs (s, t, n) = PrimaryKey <$> table <*> pure n
   where table = find (\tbl -> tableSchema tbl == s && tableName tbl == t) tabs
 
-allSynonyms :: [Column] -> PgVersion -> H.Statement Schema [Synonym]
-allSynonyms cols pgVer =
-  H.Statement sql (param HE.text) (decodeSynonyms cols) True
+allSourceColumns :: [Column] -> PgVersion -> H.Statement Schema [SourceColumn]
+allSourceColumns cols pgVer =
+  H.Statement sql (param HE.text) (decodeSourceColumns cols) True
   -- query explanation at https://gist.github.com/steve-chavez/7ee0e6590cddafb532e5f00c46275569
   where
     subselectRegex :: Text
@@ -790,13 +787,6 @@ allSynonyms cols pgVer =
       join pg_namespace sch on sch.oid = tbl.relnamespace
       where resorigtbl <> '0'
       order by view_schema, view_name, view_colum_name; |]
-
-synonymFromRow :: [Column] -> (Text,Text,Text,Text,Text,Text) -> Maybe Synonym
-synonymFromRow allCols (s1,t1,c1,s2,t2,c2) = (,) <$> col1 <*> col2
-  where
-    col1 = findCol s1 t1 c1
-    col2 = findCol s2 t2 c2
-    findCol s t c = find (\col -> (tableSchema . colTable) col == s && (tableName . colTable) col == t && colName col == c) allCols
 
 getPgVersion :: H.Session PgVersion
 getPgVersion = H.statement () $ H.Statement sql HE.noParams versionRow False

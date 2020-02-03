@@ -30,6 +30,10 @@ pRequestSelect :: Text -> Either ApiRequestError [Tree SelectItem]
 pRequestSelect selStr =
   mapError $ parse pFieldForest ("failed to parse select parameter (" <> toS selStr <> ")") (toS selStr)
 
+pRequestOnConflict :: Text -> Either ApiRequestError  [FieldName]
+pRequestOnConflict oncStr =
+  mapError $ parse pColumns ("failed to parse on_conflict parameter (" <> toS oncStr <> ")") (toS oncStr)
+
 pRequestFilter :: (Text, Text) -> Either ApiRequestError (EmbedPath, Filter)
 pRequestFilter (k, v) = mapError $ (,) <$> path <*> (Filter <$> fld <*> oper)
   where
@@ -130,12 +134,12 @@ pRelationSelect :: Parser SelectItem
 pRelationSelect = lexeme $ try ( do
     alias <- optionMaybe ( try(pFieldName <* aliasSeparator) )
     fld <- pField
-    relationDetail <- optionMaybe (
-        try ( char '+' *> pFieldName ) <|>
-        try ( char '.' *> pFieldName ) -- TODO deprecated, remove in next major version
+    hint <- optionMaybe (
+        try ( char '!' *> pFieldName) <|>
+        -- deprecated, remove in next major version
+        try ( char '.' *> pFieldName)
       )
-
-    return (fld, Nothing, alias, relationDetail)
+    return (fld, Nothing, alias, hint)
   )
 
 pFieldSelect :: Parser SelectItem

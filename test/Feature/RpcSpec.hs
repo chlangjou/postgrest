@@ -34,6 +34,12 @@ spec actualPgVersion =
             { matchStatus = 200
             , matchHeaders = ["Content-Range" <:> "0-0/*"]
             }
+        request methodHead "/rpc/getitemrange?min=2&max=4"
+                (rangeHdrs (ByteRangeFromTo 0 0)) ""
+           `shouldRespondWith` ""
+            { matchStatus = 200
+            , matchHeaders = ["Content-Range" <:> "0-0/*"]
+            }
 
       it "includes total count if requested" $ do
         request methodPost "/rpc/getitemrange"
@@ -46,6 +52,12 @@ spec actualPgVersion =
         request methodGet "/rpc/getitemrange?min=2&max=4"
                 (rangeHdrsWithCount (ByteRangeFromTo 0 0)) ""
            `shouldRespondWith` [json| [{"id":3}] |]
+            { matchStatus = 206
+            , matchHeaders = ["Content-Range" <:> "0-0/2"]
+            }
+        request methodHead "/rpc/getitemrange?min=2&max=4"
+                (rangeHdrsWithCount (ByteRangeFromTo 0 0)) ""
+           `shouldRespondWith` ""
             { matchStatus = 206
             , matchHeaders = ["Content-Range" <:> "0-0/2"]
             }
@@ -69,6 +81,12 @@ spec actualPgVersion =
         request methodGet "/rpc/getitemrange?min=2&max=4"
                 (acceptHdrs "text/csv") ""
            `shouldRespondWith` "id\n3\n4"
+            { matchStatus = 200
+            , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8"]
+            }
+        request methodHead "/rpc/getitemrange?min=2&max=4"
+                (acceptHdrs "text/csv") ""
+           `shouldRespondWith` ""
             { matchStatus = 200
             , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8"]
             }
@@ -140,10 +158,10 @@ spec actualPgVersion =
 
     context "foreign entities embedding" $ do
       it "can embed if related tables are in the exposed schema" $ do
-        post "/rpc/getproject?select=id,name,client(id),tasks(id)" [json| { "id": 1} |] `shouldRespondWith`
+        post "/rpc/getproject?select=id,name,client:clients(id),tasks(id)" [json| { "id": 1} |] `shouldRespondWith`
           [json|[{"id":1,"name":"Windows 7","client":{"id":1},"tasks":[{"id":1},{"id":2}]}]|]
           { matchHeaders = [matchContentTypeJson] }
-        get "/rpc/getproject?id=1&select=id,name,client(id),tasks(id)" `shouldRespondWith`
+        get "/rpc/getproject?id=1&select=id,name,client:clients(id),tasks(id)" `shouldRespondWith`
           [json|[{"id":1,"name":"Windows 7","client":{"id":1},"tasks":[{"id":1},{"id":2}]}]|]
           { matchHeaders = [matchContentTypeJson] }
 
@@ -159,6 +177,29 @@ spec actualPgVersion =
           { matchHeaders = [matchContentTypeJson] }
         get "/rpc/single_article?id=2&select=id,articleStars(userId)"
           `shouldRespondWith` [json|[{"id": 2, "articleStars": [{"userId": 3}]}]|]
+          { matchHeaders = [matchContentTypeJson] }
+
+      it "can embed an M2M relationship table" $
+        get "/rpc/getallusers?select=name,tasks(name)&id=gt.1"
+          `shouldRespondWith` [json|[
+            {"name":"Michael Scott", "tasks":[{"name":"Design IOS"}, {"name":"Code IOS"}, {"name":"Design OSX"}]},
+            {"name":"Dwight Schrute","tasks":[{"name":"Design w7"}, {"name":"Design IOS"}]}
+          ]|]
+          { matchHeaders = [matchContentTypeJson] }
+
+      it "can embed an M2M relationship table that has a parent relationship table" $
+        get "/rpc/getallusers?select=name,tasks(name,project:projects(name))&id=gt.1"
+          `shouldRespondWith` [json|[
+            {"name":"Michael Scott","tasks":[
+              {"name":"Design IOS","project":{"name":"IOS"}},
+              {"name":"Code IOS","project":{"name":"IOS"}},
+              {"name":"Design OSX","project":{"name":"OSX"}}
+            ]},
+            {"name":"Dwight Schrute","tasks":[
+              {"name":"Design w7","project":{"name":"Windows 7"}},
+              {"name":"Design IOS","project":{"name":"IOS"}}
+            ]}
+          ]|]
           { matchHeaders = [matchContentTypeJson] }
 
     context "a proc that returns an empty rowset" $
@@ -415,24 +456,34 @@ spec actualPgVersion =
 
       it "ignores json keys not included in ?columns" $
         post "/rpc/sayhello?columns=name"
-          [json|{"name": "John", "smth": "here", "other": "stuff", "fake_id": 13}|] `shouldRespondWith`
+          [json|{"name": "John", "smth": "here", "other": "stuff", "fake_id": 13}|]
+          `shouldRespondWith`
           [json|"Hello, John"|]
           { matchHeaders = [matchContentTypeJson] }
 
-    context "bulk RPC" $ do
-      it "works with a scalar function an returns a json array" $
+      it "only takes the first object in case of array of objects payload" $
         post "/rpc/add_them"
           [json|[
             {"a": 1, "b": 2},
             {"a": 4, "b": 6},
-            {"a": 100, "b": 200}
-          ]|] `shouldRespondWith`
+            {"a": 100, "b": 200} ]|]
+          `shouldRespondWith` "3"
+          { matchHeaders = [matchContentTypeJson] }
+
+    context "bulk RPC with params=multiple-objects" $ do
+      it "works with a scalar function an returns a json array" $
+        request methodPost "/rpc/add_them" [("Prefer", "params=multiple-objects")]
+          [json|[
+            {"a": 1, "b": 2},
+            {"a": 4, "b": 6},
+            {"a": 100, "b": 200} ]|]
+          `shouldRespondWith`
           [json|
             [3, 10, 300]
           |] { matchHeaders = [matchContentTypeJson] }
 
       it "works with a scalar function an returns a json array when posting CSV" $
-        request methodPost "/rpc/add_them" [("Content-Type", "text/csv")]
+        request methodPost "/rpc/add_them" [("Content-Type", "text/csv"), ("Prefer", "params=multiple-objects")]
           "a,b\n1,2\n4,6\n100,200"
           `shouldRespondWith`
           [json|
@@ -443,17 +494,93 @@ spec actualPgVersion =
           }
 
       it "works with a non-scalar result" $
-        post "/rpc/get_projects_below?select=id,name"
+        request methodPost "/rpc/get_projects_below?select=id,name" [("Prefer", "params=multiple-objects")]
           [json|[
             {"id": 1},
-            {"id": 5}
-          ]|] `shouldRespondWith`
+            {"id": 5} ]|]
+          `shouldRespondWith`
           [json|
             [{"id":1,"name":"Windows 7"},
              {"id":2,"name":"Windows 10"},
              {"id":3,"name":"IOS"},
              {"id":4,"name":"OSX"}]
           |] { matchHeaders = [matchContentTypeJson] }
+
+    context "HTTP request env vars" $ do
+      it "custom header is set" $
+        request methodPost "/rpc/get_guc_value"
+                  [("Custom-Header", "test")]
+            [json| { "name": "request.header.custom-header" } |]
+            `shouldRespondWith`
+            [str|"test"|]
+            { matchStatus  = 200
+            , matchHeaders = [ matchContentTypeJson ]
+            }
+      it "standard header is set" $
+        request methodPost "/rpc/get_guc_value"
+                  [("Origin", "http://example.com")]
+            [json| { "name": "request.header.origin" } |]
+            `shouldRespondWith`
+            [str|"http://example.com"|]
+            { matchStatus  = 200
+            , matchHeaders = [ matchContentTypeJson ]
+            }
+      it "current role is available as GUC claim" $
+        request methodPost "/rpc/get_guc_value" []
+            [json| { "name": "request.jwt.claim.role" } |]
+            `shouldRespondWith`
+            [str|"postgrest_test_anonymous"|]
+            { matchStatus  = 200
+            , matchHeaders = [ matchContentTypeJson ]
+            }
+      it "single cookie ends up as claims" $
+        request methodPost "/rpc/get_guc_value" [("Cookie","acookie=cookievalue")]
+          [json| {"name":"request.cookie.acookie"} |]
+            `shouldRespondWith`
+            [str|"cookievalue"|]
+            { matchStatus = 200
+            , matchHeaders = []
+            }
+      it "multiple cookies ends up as claims" $
+        request methodPost "/rpc/get_guc_value" [("Cookie","acookie=cookievalue;secondcookie=anothervalue")]
+          [json| {"name":"request.cookie.secondcookie"} |]
+            `shouldRespondWith`
+            [str|"anothervalue"|]
+            { matchStatus = 200
+            , matchHeaders = []
+            }
+      it "app settings available" $
+        request methodPost "/rpc/get_guc_value" []
+          [json| { "name": "app.settings.app_host" } |]
+            `shouldRespondWith`
+            [str|"localhost"|]
+            { matchStatus  = 200
+            , matchHeaders = [ matchContentTypeJson ]
+            }
+      it "gets the Authorization value" $
+        request methodPost "/rpc/get_guc_value" [authHeaderJWT "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA"]
+          [json| {"name":"request.header.authorization"} |]
+            `shouldRespondWith`
+            [str|"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoicG9zdGdyZXN0X3Rlc3RfYXV0aG9yIn0.Xod-F15qsGL0WhdOCr2j3DdKuTw9QJERVgoFD3vGaWA"|]
+            { matchStatus = 200
+            , matchHeaders = []
+            }
+      it "gets the http method" $
+        request methodPost "/rpc/get_guc_value" []
+          [json| {"name":"request.method"} |]
+            `shouldRespondWith`
+            [str|"POST"|]
+            { matchStatus = 200
+            , matchHeaders = []
+            }
+      it "gets the http path" $
+        request methodPost "/rpc/get_guc_value" []
+          [json| {"name":"request.path"} |]
+            `shouldRespondWith`
+            [str|"/rpc/get_guc_value"|]
+            { matchStatus = 200
+            , matchHeaders = []
+            }
 
     context "binary output" $ do
       context "Proc that returns scalar" $ do

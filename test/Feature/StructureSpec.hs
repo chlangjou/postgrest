@@ -21,8 +21,10 @@ spec :: SpecWith Application
 spec = do
 
   describe "OpenAPI" $ do
-    it "root path returns a valid openapi spec" $
+    it "root path returns a valid openapi spec" $ do
       validateOpenApiResponse [("Accept", "application/openapi+json")]
+      request methodHead "/" (acceptHdrs "application/openapi+json") ""
+        `shouldRespondWith` "" { matchStatus  = 200 }
 
     it "should respond to openapi request on none root path with 415" $
       request methodGet "/items"
@@ -227,6 +229,23 @@ spec = do
                 { "$ref": "#/parameters/limit" },
                 { "$ref": "#/parameters/preferCount" }
               ]
+            |]
+
+    describe "VIEW that has a source FK based on a UNIQUE key" $
+
+      it "includes fk description" $ do
+        r <- simpleBody <$> get "/"
+
+        let referralLink = r ^? key "definitions" . key "referrals" . key "properties" . key "link"
+
+        liftIO $
+          referralLink `shouldBe` Just
+            [aesonQQ|
+              {
+                "format": "integer",
+                "type": "integer",
+                "description": "Note:\nThis is a Foreign Key to `pages.link`.<fk table='pages' column='link'/>"
+              }
             |]
 
     describe "PostgreSQL to Swagger Type Mapping" $ do

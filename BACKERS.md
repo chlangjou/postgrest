@@ -41,6 +41,8 @@ PostgREST ongoing development is only possible thanks to our Sponsors and Backer
 - Nicholas DiBiase
 - Christopher Reid
 - Nathan Bouscal
+- Daniel Rafaj
+- David Fenko
 
 ## Former Backers
 

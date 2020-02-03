@@ -148,15 +148,6 @@ spec actualPgVersion = do
             simpleBody p `shouldBe` [json| [] |]
             simpleStatus p `shouldBe` created201
 
-        it "can insert in tables with no select privileges" $ do
-          p <- request methodPost "/insertonly"
-                       [("Prefer", "return=minimal")]
-                       [json| { "v":"some value" } |]
-          liftIO $ do
-            simpleBody p `shouldBe` ""
-            simpleStatus p `shouldBe` created201
-
-
         it "can post nulls" $ do
           p <- request methodPost "/no_pk"
                        [("Prefer", "return=representation")]
@@ -257,36 +248,6 @@ spec actualPgVersion = do
       it "successfully inserts two rows with all-default columns" $
         post "/items" "[{}, {}]" `shouldRespondWith` ""
           { matchStatus  = 201
-          , matchHeaders = []
-          }
-
-    context "table with limited privileges" $ do
-      it "succeeds if correct select is applied" $
-        request methodPost "/limited_article_stars?select=article_id,user_id" [("Prefer", "return=representation")]
-          [json| {"article_id": 2, "user_id": 1} |] `shouldRespondWith` [str|[{"article_id":2,"user_id":1}]|]
-          { matchStatus  = 201
-          , matchHeaders = []
-          }
-      it "fails if more columns are selected" $
-        request methodPost "/limited_article_stars?select=article_id,user_id,created_at" [("Prefer", "return=representation")]
-          [json| {"article_id": 2, "user_id": 2} |] `shouldRespondWith` (
-        if actualPgVersion >= pgVersion112 then
-        [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for view limited_article_stars"}|]
-           else
-        [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for relation limited_article_stars"}|]
-                                                                        )
-          { matchStatus  = 401
-          , matchHeaders = []
-          }
-      it "fails if select is not specified" $
-        request methodPost "/limited_article_stars" [("Prefer", "return=representation")]
-          [json| {"article_id": 3, "user_id": 1} |] `shouldRespondWith` (
-        if actualPgVersion >= pgVersion112 then
-        [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for view limited_article_stars"}|]
-           else
-        [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for relation limited_article_stars"}|]
-                                                                        )
-          { matchStatus  = 401
           , matchHeaders = []
           }
 
@@ -537,7 +498,7 @@ spec actualPgVersion = do
             matchHeaders = ["Content-Range" <:> "*/*"]
           }
 
-      it "makes no updates and and returns 200, when patching with an empty json object and return=rep" $
+      it "makes no updates and returns 200, when patching with an empty json object and return=rep" $
         request methodPatch "/items" [("Prefer", "return=representation")] [json| {} |]
           `shouldRespondWith` "[]"
           {
@@ -588,3 +549,129 @@ spec actualPgVersion = do
       liftIO $ do
         simpleBody p2 `shouldBe` [str|[{"owner":"jroe","secret":"lolcat"}]|]
         simpleStatus p2 `shouldBe` created201
+
+  context "tables with self reference foreign keys" $ do
+    it "embeds parent after insert" $
+      request methodPost "/web_content?select=id,name,parent_content:p_web_id(name)"
+              [("Prefer", "return=representation")]
+        [json|{"id":6, "name":"wot", "p_web_id":4}|]
+        `shouldRespondWith`
+        [json|[{"id":6,"name":"wot","parent_content":{"name":"wut"}}]|]
+        { matchStatus  = 201
+        , matchHeaders = [ matchContentTypeJson , "Location" <:> "/web_content?id=eq.6" ]
+        }
+
+    it "embeds childs after update" $
+      request methodPatch "/web_content?id=eq.0&select=id,name,web_content(name)"
+              [("Prefer", "return=representation")]
+        [json|{"name": "tardis-patched"}|]
+        `shouldRespondWith`
+        [json|
+          [ { "id": 0, "name": "tardis-patched", "web_content": [ { "name": "fezz" }, { "name": "foo" }, { "name": "bar" } ]} ]
+        |]
+        { matchStatus  = 200,
+          matchHeaders = [matchContentTypeJson]
+        }
+
+    it "embeds parent, childs and grandchilds after update" $
+      request methodPatch "/web_content?id=eq.0&select=id,name,web_content(name,web_content(name)),parent_content:p_web_id(name)"
+              [("Prefer", "return=representation")]
+        [json|{"name": "tardis-patched-2"}|]
+        `shouldRespondWith`
+        [json| [
+          {
+            "id": 0,
+            "name": "tardis-patched-2",
+            "parent_content": { "name": "wat" },
+            "web_content": [
+                { "name": "fezz", "web_content": [ { "name": "wut" } ] },
+                { "name": "foo",  "web_content": [] },
+                { "name": "bar",  "web_content": [] }
+            ]
+          }
+        ] |]
+        { matchStatus  = 200,
+          matchHeaders = [matchContentTypeJson]
+        }
+
+    it "embeds childs after update without explicitly including the id in the ?select" $
+      request methodPatch "/web_content?id=eq.0&select=name,web_content(name)"
+              [("Prefer", "return=representation")]
+        [json|{"name": "tardis-patched"}|]
+        `shouldRespondWith`
+        [json|
+          [ { "name": "tardis-patched", "web_content": [ { "name": "fezz" }, { "name": "foo" }, { "name": "bar" } ]} ]
+        |]
+        { matchStatus  = 200,
+          matchHeaders = [matchContentTypeJson]
+        }
+
+    it "embeds an M2M relationship plus parent after update" $
+      request methodPatch "/users?id=eq.1&select=name,tasks(name,project:projects(name))"
+              [("Prefer", "return=representation")]
+        [json|{"name": "Kevin Malone"}|]
+        `shouldRespondWith`
+        [json|[
+          {
+            "name": "Kevin Malone",
+            "tasks": [
+                { "name": "Design w7", "project": { "name": "Windows 7" } },
+                { "name": "Code w7", "project": { "name": "Windows 7" } },
+                { "name": "Design w10", "project": { "name": "Windows 10" } },
+                { "name": "Code w10", "project": { "name": "Windows 10" } }
+            ]
+          }
+        ]|]
+        { matchStatus  = 200,
+          matchHeaders = [matchContentTypeJson]
+        }
+
+  context "table with limited privileges" $ do
+    it "succeeds inserting if correct select is applied" $
+      request methodPost "/limited_article_stars?select=article_id,user_id" [("Prefer", "return=representation")]
+        [json| {"article_id": 2, "user_id": 1} |] `shouldRespondWith` [str|[{"article_id":2,"user_id":1}]|]
+        { matchStatus  = 201
+        , matchHeaders = []
+        }
+
+    it "fails inserting if more columns are selected" $
+      request methodPost "/limited_article_stars?select=article_id,user_id,created_at" [("Prefer", "return=representation")]
+        [json| {"article_id": 2, "user_id": 2} |] `shouldRespondWith` (
+      if actualPgVersion >= pgVersion112 then
+      [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for view limited_article_stars"}|]
+         else
+      [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for relation limited_article_stars"}|]
+                                                                      )
+        { matchStatus  = 401
+        , matchHeaders = []
+        }
+
+    it "fails inserting if select is not specified" $
+      request methodPost "/limited_article_stars" [("Prefer", "return=representation")]
+        [json| {"article_id": 3, "user_id": 1} |] `shouldRespondWith` (
+      if actualPgVersion >= pgVersion112 then
+      [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for view limited_article_stars"}|]
+         else
+      [str|{"hint":null,"details":null,"code":"42501","message":"permission denied for relation limited_article_stars"}|]
+                                                                      )
+        { matchStatus  = 401
+        , matchHeaders = []
+        }
+
+    it "can insert in a table with no select and return=minimal" $ do
+      p <- request methodPost "/insertonly"
+                   [("Prefer", "return=minimal")]
+                   [json| { "v":"some value" } |]
+      liftIO $ do
+        simpleBody p `shouldBe` ""
+        simpleStatus p `shouldBe` created201
+
+    it "succeeds updating row and gives a 204 when using return=minimal" $
+      request methodPatch "/app_users?id=eq.1" [("Prefer", "return=minimal")]
+        [json| { "password": "passxyz" } |]
+          `shouldRespondWith` 204
+
+    it "can update without return=minimal and no explicit select" $
+      request methodPatch "/app_users?id=eq.1" []
+        [json| { "password": "passabc" } |]
+          `shouldRespondWith` 204

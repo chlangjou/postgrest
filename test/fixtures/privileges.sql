@@ -66,6 +66,8 @@ GRANT ALL ON TABLE
     , perf_articles
     , employees
     , tiobe_pls
+    , single_unique
+    , compound_unique
     , only_pk
     , family_tree
     , managers
@@ -101,6 +103,24 @@ GRANT ALL ON TABLE
     , pgrst_reserved_chars
     , authors_w_entities
     , openapi_types
+    , getallprojects_view
+    , get_projects_above_view
+    , web_content
+    , pages
+    , referrals
+    , big_projects
+    , sites
+    , jobs
+    , main_jobs
+    , whatev_projects
+    , whatev_sites
+    , whatev_jobs
+    , agents
+    , departments
+    , schedules
+    , activities
+    , unit_workdays
+    , stuff
 TO postgrest_test_anonymous;
 
 GRANT INSERT ON TABLE insertonly TO postgrest_test_anonymous;
@@ -119,6 +139,10 @@ GRANT ALL ON TABLE authors_only TO postgrest_test_author;
 GRANT SELECT (article_id, user_id) ON TABLE limited_article_stars TO postgrest_test_anonymous;
 GRANT INSERT (article_id, user_id) ON TABLE limited_article_stars TO postgrest_test_anonymous;
 GRANT UPDATE (article_id, user_id) ON TABLE limited_article_stars TO postgrest_test_anonymous;
+
+GRANT SELECT(id, email) ON TABLE app_users TO postgrest_test_anonymous;
+GRANT INSERT, UPDATE    ON TABLE app_users TO postgrest_test_anonymous;
+GRANT DELETE            ON TABLE app_users TO postgrest_test_anonymous;
 
 REVOKE EXECUTE ON FUNCTION privileged_hello(text) FROM PUBLIC; -- All functions are available to every role(PUBLIC) by default
 GRANT EXECUTE ON FUNCTION privileged_hello(text) TO postgrest_test_author;

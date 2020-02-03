@@ -1,11 +1,12 @@
 {-# LANGUAGE LambdaCase #-}
 {-|
-Module      : PostgREST.QueryBuilder.Private
+Module      : PostgREST.Private.QueryFragment
 Description : Helper functions for PostgREST.QueryBuilder.
--}
-module PostgREST.QueryBuilder.Private where
 
-import qualified Data.ByteString.Char8         as BS
+Any function that outputs a SqlFragment should be in this module.
+-}
+module PostgREST.Private.QueryFragment where
+
 import qualified Data.HashMap.Strict           as HM
 import           Data.Maybe
 import           Data.Text                     (intercalate,
@@ -13,63 +14,20 @@ import           Data.Text                     (intercalate,
                                                 toLower, unwords)
 import qualified Data.Text                     as T (map, null,
                                                      takeWhile)
-import qualified Data.Text.Encoding            as T
-import qualified Hasql.Decoders                as HD
-import qualified Hasql.Encoders                as HE
-import qualified Hasql.Statement               as H
 import           PostgREST.Types
 import           Protolude                     hiding (cast,
                                                 intercalate, replace)
 import           Text.InterpolatedString.Perl6 (qc)
 
-column :: HD.Value a -> HD.Row a
-column = HD.column . HD.nonNullable
-
-nullableColumn :: HD.Value a -> HD.Row (Maybe a)
-nullableColumn = HD.column . HD.nullable
-
-element :: HD.Value a -> HD.Array a
-element = HD.element . HD.nonNullable
-
-param :: HE.Value a -> HE.Params a
-param = HE.param . HE.nonNullable
-
-{-| The generic query result format used by API responses. The location header
-    is represented as a list of strings containing variable bindings like
-    @"k1=eq.42"@, or the empty list if there is no location header.
--}
-type ResultsWithCount = (Maybe Int64, Int64, [BS.ByteString], BS.ByteString)
-
-standardRow :: HD.Row ResultsWithCount
-standardRow = (,,,) <$> nullableColumn HD.int8 <*> column HD.int8
-                    <*> column header <*> column HD.bytea
-  where
-    header = HD.array $ HD.dimension replicateM $ element HD.bytea
-
-noLocationF :: Text
+noLocationF :: SqlFragment
 noLocationF = "array[]::text[]"
-
-{-| Read and Write api requests use a similar response format which includes
-    various record counts and possible location header. This is the decoder
-    for that common type of query.
--}
-decodeStandard :: HD.Result ResultsWithCount
-decodeStandard =
-  HD.singleRow standardRow
-
-decodeStandardMay :: HD.Result (Maybe ResultsWithCount)
-decodeStandardMay =
-  HD.rowMaybe standardRow
-
-removeSourceCTESchema :: Schema -> TableName -> QualifiedIdentifier
-removeSourceCTESchema schema tbl = QualifiedIdentifier (if tbl == sourceCTEName then "" else schema) tbl
 
 -- Due to the use of the `unknown` encoder we need to cast '$1' when the value is not used in the main query
 -- otherwise the query will err with a `could not determine data type of parameter $1`.
 -- This happens because `unknown` relies on the context to determine the value type.
 -- The error also happens on raw libpq used with C.
 ignoredBody :: SqlFragment
-ignoredBody = "ignored_body AS (SELECT $1::text) "
+ignoredBody = "pgrst_ignored_body AS (SELECT $1::text) "
 
 -- |
 -- These CTEs convert a json object into a json array, this way we can use json_populate_recordset for all json payloads
@@ -139,9 +97,6 @@ fromQi t = (if s == "" then "" else pgFmtIdent s <> ".") <> pgFmtIdent n
     n = qiName t
     s = qiSchema t
 
-unicodeStatement :: Text -> HE.Params a -> HD.Result b -> Bool -> H.Statement a b
-unicodeStatement = H.Statement . T.encodeUtf8
-
 emptyOnFalse :: Text -> Bool -> Text
 emptyOnFalse val cond = if cond then "" else val
 
@@ -195,9 +150,8 @@ pgFmtFilter table (Filter fld (OpExpr hasNot oper)) = notOp <> " " <> case oper 
      (find ((==) . toLower $ v) ["null","true","false"])
 
 pgFmtJoinCondition :: JoinCondition -> SqlFragment
-pgFmtJoinCondition (JoinCondition (qi, col1) (QualifiedIdentifier schema fTable, col2)) =
-  pgFmtColumn qi col1 <> " = " <>
-  pgFmtColumn (removeSourceCTESchema schema fTable) col2
+pgFmtJoinCondition (JoinCondition (qi1, col1) (qi2, col2)) =
+  pgFmtColumn qi1 col1 <> " = " <> pgFmtColumn qi2 col2
 
 pgFmtLogicTree :: QualifiedIdentifier -> LogicTree -> SqlFragment
 pgFmtLogicTree qi (Expr hasNot op forest) = notOp <> " (" <> intercalate (" " <> show op <> " ") (pgFmtLogicTree qi <$> forest) <> ")"
@@ -225,13 +179,27 @@ pgFmtAs fName jp Nothing = case jOp <$> lastMay jp of
   Nothing -> ""
 pgFmtAs _ _ (Just alias) = " AS " <> pgFmtIdent alias
 
-pgFmtSetLocal :: Text -> (Text, Text) -> SqlFragment
-pgFmtSetLocal prefix (k, v) =
-  "SET LOCAL " <> pgFmtIdent (prefix <> k) <> " = " <> pgFmtLit v <> ";"
-
-pgFmtSetLocalSearchPath :: [Text] -> SqlFragment
-pgFmtSetLocalSearchPath vals =
-  "SET LOCAL search_path = " <> intercalate ", " (pgFmtLit <$> vals) <> ";"
-
 trimNullChars :: Text -> Text
 trimNullChars = T.takeWhile (/= '\x0')
+
+countF :: SqlQuery -> Bool -> (SqlFragment, SqlFragment)
+countF countQuery shouldCount =
+  if shouldCount
+    then (
+        ", pg_source_count AS (" <> countQuery <> ")"
+      , "(SELECT pg_catalog.count(*) FROM pg_source_count)" )
+    else (
+        mempty
+      , "null::bigint")
+
+returningF :: QualifiedIdentifier -> [FieldName] -> SqlFragment
+returningF qi returnings =
+  if null returnings
+    then "RETURNING 1" -- For mutation cases where there's no ?select, we return 1 to know how many rows were modified
+    else "RETURNING " <> intercalate ", " (pgFmtColumn qi <$> returnings)
+
+responseHeadersF :: PgVersion -> SqlFragment
+responseHeadersF pgVer =
+  if pgVer >= pgVersion96
+    then "coalesce(nullif(current_setting('response.headers', true), ''), '[]')" :: Text -- nullif is used because of https://gist.github.com/steve-chavez/8d7033ea5655096903f3b52f8ed09a15
+    else "'[]'" :: Text

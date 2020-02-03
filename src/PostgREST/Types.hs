@@ -6,6 +6,9 @@ Description : PostgREST common types and functions used by the rest of the modul
 
 module PostgREST.Types where
 
+import Control.Lens.Getter (view)
+import Control.Lens.Tuple  (_1)
+
 import qualified Data.Aeson               as JSON
 import qualified Data.ByteString          as BS
 import qualified Data.ByteString.Internal as BS (c2w)
@@ -56,10 +59,46 @@ decodeContentType ct = case BS.takeWhile (/= BS.c2w ';') ct of
   "*/*"                               -> CTAny
   ct'                                 -> CTOther ct'
 
+-- | A SQL query that can be executed independently
+type SqlQuery = Text
+
+-- | A part of a SQL query that cannot be executed independently
+type SqlFragment = Text
+
 data PreferResolution = MergeDuplicates | IgnoreDuplicates deriving Eq
 instance Show PreferResolution where
   show MergeDuplicates  = "resolution=merge-duplicates"
   show IgnoreDuplicates = "resolution=ignore-duplicates"
+
+-- | How to return the mutated data. From https://tools.ietf.org/html/rfc7240#section-4.2
+data PreferRepresentation = Full        -- ^ Return the body plus the Location header(in case of POST).
+                          | HeadersOnly -- ^ Return the Location header(in case of POST). This needs a SELECT privilege on the pk.
+                          | None        -- ^ Return nothing from the mutated data.
+                          deriving Eq
+instance Show PreferRepresentation where
+  show Full        = "return=representation"
+  show None        = "return=minimal"
+  show HeadersOnly = mempty
+
+data PreferParameters
+  = SingleObject    -- ^ Pass all parameters as a single json object to a stored procedure
+  | MultipleObjects -- ^ Pass an array of json objects as params to a stored procedure
+  deriving Eq
+
+instance Show PreferParameters where
+  show SingleObject    = "params=single-object"
+  show MultipleObjects = "params=multiple-objects"
+
+data PreferCount
+  = ExactCount     -- ^ exact count(slower)
+  | PlannedCount   -- ^ PostgreSQL query planner rows count guess. Done by using EXPLAIN {query}.
+  | EstimatedCount -- ^ use the query planner rows if the count is superior to max-rows, otherwise get the exact count.
+  deriving Eq
+
+instance Show PreferCount where
+  show ExactCount     = "count=exact"
+  show PlannedCount   = "count=planned"
+  show EstimatedCount = "count=estimated"
 
 data DbStructure = DbStructure {
   dbTables      :: [Table]
@@ -135,10 +174,19 @@ specifiedProcArgs keys proc =
   in
   (\k -> fromMaybe (PgArg k "text" True) (find ((==) k . pgaName) args)) <$> S.toList keys
 
+procReturnsScalar :: ProcDescription -> Bool
+procReturnsScalar proc = case proc of
+  ProcDescription{pdReturnType = (Single (Scalar _))} -> True
+  _                                                   -> False
+
+procTableName :: ProcDescription -> Maybe TableName
+procTableName proc = case pdReturnType proc of
+  SetOf  (Composite qi) -> Just $ qiName qi
+  Single (Composite qi) -> Just $ qiName qi
+  _                     -> Nothing
+
 type Schema = Text
 type TableName = Text
-type SqlQuery = Text
-type SqlFragment = Text
 
 data Table = Table {
   tableSchema      :: Schema
@@ -149,6 +197,9 @@ data Table = Table {
 
 instance Eq Table where
   Table{tableSchema=s1,tableName=n1} == Table{tableSchema=s2,tableName=n2} = s1 == s2 && n1 == n2
+
+tableQi :: Table -> QualifiedIdentifier
+tableQi Table{tableSchema=s, tableName=n} = QualifiedIdentifier s n
 
 newtype ForeignKey = ForeignKey { fkCol :: Column } deriving (Show, Eq, Ord)
 
@@ -171,8 +222,8 @@ data Column =
 instance Eq Column where
   Column{colTable=t1,colName=n1} == Column{colTable=t2,colName=n2} = t1 == t2 && n1 == n2
 
--- | A view column that refers to a table column
-type Synonym = (Column, ViewColumn)
+-- | The source table column a view column refers to
+type SourceColumn = (Column, ViewColumn)
 type ViewColumn = Column
 
 data PrimaryKey = PrimaryKey {
@@ -206,30 +257,45 @@ data QualifiedIdentifier = QualifiedIdentifier {
 } deriving (Show, Eq, Ord)
 
 
-data RelationType = Child | Parent | Many | Root deriving (Show, Eq)
+-- | The relationship [cardinality](https://en.wikipedia.org/wiki/Cardinality_(data_modeling)).
+-- | TODO: missing one-to-one
+data Cardinality = O2M -- ^ one-to-many,  previously known as Parent
+                 | M2O -- ^ many-to-one,  previously known as Child
+                 | M2M -- ^ many-to-many, previously known as Many
+                 deriving Eq
+instance Show Cardinality where
+  show O2M = "o2m"
+  show M2O = "m2o"
+  show M2M = "m2m"
+
+type ConstraintName = Text
 
 {-|
-  The name 'Relation' here is used with the meaning
-  "What is the relation between the current node and the parent node".
-  It has nothing to do with PostgreSQL referring to tables/views as relations.
-  The order of the relColumns and relFColumns should be maintained to get
-  the join conditions right.
+  "Relation"ship between two tables.
+  The order of the relColumns and relFColumns should be maintained to get the join conditions right.
   TODO merge relColumns and relFColumns to a tuple or Data.Bimap
 -}
 data Relation = Relation {
-  relTable     :: Table
-, relColumns   :: [Column]
-, relFTable    :: Table
-, relFColumns  :: [Column]
-, relType      :: RelationType
--- The Link attrs are used when RelationType == Many
-, relLinkTable :: Maybe Table
-, relLinkCols1 :: Maybe [Column]
-, relLinkCols2 :: Maybe [Column]
+  relTable      :: Table
+, relColumns    :: [Column]
+, relConstraint :: Maybe ConstraintName -- ^ Just on O2M/M2O, Nothing on M2M
+, relFTable     :: Table
+, relFColumns   :: [Column]
+, relType       :: Cardinality
+, relJunction   :: Maybe Junction -- ^ Junction for M2M Cardinality
 } deriving (Show, Eq)
 
-isSelfJoin :: Relation -> Bool
-isSelfJoin r = relType r /= Root && relTable r == relFTable r
+-- | Junction table on an M2M relationship
+data Junction = Junction {
+  junTable       :: Table
+, junConstraint1 :: Maybe ConstraintName
+, junCols1       :: [Column]
+, junConstraint2 :: Maybe ConstraintName
+, junCols2       :: [Column]
+} deriving (Show, Eq)
+
+isSelfReference :: Relation -> Bool
+isSelfReference r = relTable r == relFTable r
 
 data PayloadJSON =
   -- | Cached attributes of a JSON payload
@@ -333,24 +399,33 @@ type RpcQParam = (Text, Text)
   Custom guc header, it's obtained by parsing the json in a:
   `SET LOCAL "response.headers" = '[{"Set-Cookie": ".."}]'
 -}
-newtype GucHeader = GucHeader (Text, Text)
+newtype GucHeader = GucHeader (CI.CI ByteString, ByteString)
+  deriving (Show, Eq)
 
 instance JSON.FromJSON GucHeader where
   parseJSON (JSON.Object o) = case headMay (M.toList o) of
-    Just (k, JSON.String s) | M.size o == 1 -> pure $ GucHeader (k, s)
+    Just (k, JSON.String s) | M.size o == 1 -> pure $ GucHeader (CI.mk $ toS k, toS s)
                             | otherwise     -> mzero
     _ -> mzero
   parseJSON _          = mzero
 
-toHeaders :: [GucHeader] -> [Header]
-toHeaders = map $ \(GucHeader (k, v)) -> (CI.mk $ toS k, toS v)
+unwrapGucHeader :: GucHeader -> Header
+unwrapGucHeader (GucHeader (k, v)) = (k, v)
+
+-- | Add headers not already included to allow the user to override them instead of duplicating them
+addHeadersIfNotIncluded :: [Header] -> [Header] -> [Header]
+addHeadersIfNotIncluded newHeaders initialHeaders =
+  filter (\(nk, _) -> isNothing $ find (\(ik, _) -> ik == nk) initialHeaders) newHeaders ++
+  initialHeaders
 
 {-|
   This type will hold information about which particular 'Relation' between two tables to choose when there are multiple ones.
   Specifically, it will contain the name of the foreign key or the join table in many to many relations.
 -}
-type RelationDetail = Text
-type SelectItem = (Field, Maybe Cast, Maybe Alias, Maybe RelationDetail)
+type SelectItem = (Field, Maybe Cast, Maybe Alias, Maybe EmbedHint)
+-- | Disambiguates an embedding operation when there's multiple relationships between two tables.
+-- | Can be the name of a foreign key constraint, column name or the junction in an m2m relationship.
+type EmbedHint = Text
 -- | Path of the embedded levels, e.g "clients.projects.name=eq.." gives Path ["clients", "projects"]
 type EmbedPath = [Text]
 data Filter = Filter { field::Field, opExpr::OpExpr } deriving (Show, Eq)
@@ -359,11 +434,11 @@ data JoinCondition = JoinCondition (QualifiedIdentifier, FieldName)
 
 data ReadQuery = Select {
     select         :: [SelectItem]
-  , from           :: TableName
+  , from           :: QualifiedIdentifier
 -- | A table alias is used in case of self joins
   , fromAlias      :: Maybe Alias
 -- | Only used for Many to Many joins. Parent and Child joins use explicit joins.
-  , implicitJoins  :: [TableName]
+  , implicitJoins  :: [QualifiedIdentifier]
   , where_         :: [LogicTree]
   , joinConditions :: [JoinCondition]
   , order          :: [OrderTerm]
@@ -372,30 +447,34 @@ data ReadQuery = Select {
 
 data MutateQuery =
   Insert {
-    in_        :: TableName
+    in_        :: QualifiedIdentifier
   , insCols    :: S.Set FieldName
   , onConflict :: Maybe (PreferResolution, [FieldName])
   , where_     :: [LogicTree]
   , returning  :: [FieldName]
   }|
   Update {
-    in_       :: TableName
+    in_       :: QualifiedIdentifier
   , updCols   :: S.Set FieldName
   , where_    :: [LogicTree]
   , returning :: [FieldName]
   }|
   Delete {
-    in_       :: TableName
+    in_       :: QualifiedIdentifier
   , where_    :: [LogicTree]
   , returning :: [FieldName]
   } deriving (Show, Eq)
 
-data DbRequest = DbRead ReadRequest | DbMutate MutateRequest
 type ReadRequest = Tree ReadNode
-type ReadNode = (ReadQuery, (NodeName, Maybe Relation, Maybe Alias, Maybe RelationDetail, Depth))
--- Depth of the ReadRequest tree
-type Depth = Integer
 type MutateRequest = MutateQuery
+
+type ReadNode = (ReadQuery, (NodeName, Maybe Relation, Maybe Alias, Maybe EmbedHint, Depth))
+type Depth = Integer
+
+-- First level FieldNames(e.g get a,b from /table?select=a,b,other(c,d))
+fstFieldNames :: ReadRequest -> [FieldName]
+fstFieldNames (Node (sel, _) _) =
+  fst . view _1 <$> select sel
 
 data PgVersion = PgVersion {
   pgvNum  :: Int32
@@ -440,8 +519,6 @@ sourceCTEName = "pg_source"
 type JSPath = [JSPathExp]
 -- | jspath expression, e.g. .property, .property[0] or ."property-dash"
 data JSPathExp = JSPKey Text | JSPIdx Int deriving (Eq, Show)
-
-
 
 -- | Current database connection status data ConnectionStatus
 data ConnectionStatus

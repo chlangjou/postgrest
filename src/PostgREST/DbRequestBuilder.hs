@@ -14,248 +14,217 @@ A query tree is built in case of resource embedding. By inferring the relationsh
 module PostgREST.DbRequestBuilder (
   readRequest
 , mutateRequest
-, fieldNames
 ) where
 
-import qualified Data.ByteString.Char8 as BS
-import qualified Data.HashMap.Strict   as M
-import qualified Data.Set              as S
+import qualified Data.HashMap.Strict as M
+import qualified Data.Set            as S
 
 import Control.Arrow           ((***))
-import Control.Lens.Getter     (view)
-import Control.Lens.Tuple      (_1)
 import Data.Either.Combinators (mapLeft)
 import Data.Foldable           (foldr1)
 import Data.List               (delete)
-import Data.Maybe              (fromJust)
 import Data.Text               (isInfixOf)
-import Text.Regex.TDFA         ((=~))
-import Unsafe                  (unsafeHead)
 
 import Control.Applicative
 import Data.Tree
 import Network.Wai
 
-import PostgREST.ApiRequest (Action (..), ApiRequest (..),
-                             PreferRepresentation (..),
-                             PreferRepresentation (..), Target (..))
+import PostgREST.ApiRequest (Action (..), ApiRequest (..))
 import PostgREST.Error      (ApiRequestError (..), errorResponseFor)
 import PostgREST.Parsers
 import PostgREST.RangeQuery (NonnegRange, allRange, restrictRange)
 import PostgREST.Types
 import Protolude            hiding (from)
 
-readRequest :: Maybe Integer -> [Relation] -> Maybe ProcDescription -> ApiRequest -> Either Response ReadRequest
-readRequest maxRows allRels proc apiRequest  =
+readRequest :: Schema -> TableName -> Maybe Integer -> [Relation] -> ApiRequest -> Either Response ReadRequest
+readRequest schema rootTableName maxRows allRels apiRequest  =
   mapLeft errorResponseFor $
   treeRestrictRange maxRows =<<
-  augumentRequestWithJoin schema relations =<<
+  augumentRequestWithJoin schema rootRels =<<
   addFiltersOrdersRanges apiRequest <*>
-  (buildReadRequest <$> pRequestSelect (iSelect apiRequest))
+  (initReadRequest rootName <$> pRequestSelect sel)
   where
-    action = iAction apiRequest
-    (schema, rootTableName) = fromJust $ -- Make it safe
-      let target = iTarget apiRequest in
-      case target of
-        (TargetIdent (QualifiedIdentifier s t) ) -> Just (s, t)
-        (TargetProc  (QualifiedIdentifier s pName) _ ) -> Just (s, tName)
-          where
-            tName = case pdReturnType <$> proc of
-              Just (SetOf (Composite qi))  -> qiName qi
-              Just (Single (Composite qi)) -> qiName qi
-              _                            -> pName
+    sel = fromMaybe "*" $ iSelect apiRequest -- default to all columns requested (SELECT *) for a non existent ?select querystring param
+    (rootName, rootRels) = rootWithRels schema rootTableName allRels (iAction apiRequest)
 
-        _ -> Nothing
+-- Get the root table name with its relationships according to the Action type.
+-- This is done because of the shape of the final SQL Query. The mutation cases are wrapped in a WITH {sourceCTEName}(see Statements.hs).
+-- So we need a FROM {sourceCTEName} instead of FROM {tableName}.
+rootWithRels :: Schema -> TableName -> [Relation] -> Action -> (QualifiedIdentifier, [Relation])
+rootWithRels schema rootTableName allRels action = case action of
+  ActionRead _ -> (QualifiedIdentifier schema rootTableName, allRels) -- normal read case
+  _            -> (QualifiedIdentifier mempty sourceCTEName, mapMaybe toSourceRel allRels ++ allRels) -- mutation cases and calling proc
+  where
+    -- To enable embedding in the sourceCTEName cases we need to replace the foreign key tableName in the Relation
+    -- with {sourceCTEName}. This way findRel can find relationships with sourceCTEName.
+    toSourceRel :: Relation -> Maybe Relation
+    toSourceRel r@Relation{relTable=t}
+      | rootTableName == tableName t = Just $ r {relTable=t {tableName=sourceCTEName}}
+      | otherwise                    = Nothing
 
-    -- Build tree with a Depth attribute so when a self join occurs we can differentiate the parent and child tables by having
-    -- an alias like "table_depth", this is related to issue #987.
-    buildReadRequest :: [Tree SelectItem] -> ReadRequest
-    buildReadRequest fieldTree =
-      let rootDepth = 0
-          rootNodeName = if action == ActionRead then rootTableName else sourceCTEName in
-      foldr (treeEntry rootDepth) (Node (Select [] rootNodeName Nothing [] [] [] [] allRange, (rootNodeName, Nothing, Nothing, Nothing, rootDepth)) []) fieldTree
-      where
-        treeEntry :: Depth -> Tree SelectItem -> ReadRequest -> ReadRequest
-        treeEntry depth (Node fld@((fn, _),_,alias,relationDetail) fldForest) (Node (q, i) rForest) =
-          let nxtDepth = succ depth in
-          case fldForest of
-            [] -> Node (q {select=fld:select q}, i) rForest
-            _  -> Node (q, i) $
-                  foldr (treeEntry nxtDepth) (Node (Select [] fn Nothing [] [] [] [] allRange, (fn, Nothing, alias, relationDetail, nxtDepth)) []) fldForest:rForest
-
-    relations :: [Relation]
-    relations = case action of
-      ActionCreate   -> fakeSourceRelations ++ allRels
-      ActionUpdate   -> fakeSourceRelations ++ allRels
-      ActionDelete   -> fakeSourceRelations ++ allRels
-      ActionInvoke _ -> fakeSourceRelations ++ allRels
-      _              -> allRels
-      where fakeSourceRelations = mapMaybe (toSourceRelation rootTableName) allRels
-
--- in a relation where one of the tables matches "TableName"
--- replace the name to that table with pg_source
--- this "fake" relations is needed so that in a mutate query
--- we can look at the "returning *" part which is wrapped with a "with"
--- as just another table that has relations with other tables
-toSourceRelation :: TableName -> Relation -> Maybe Relation
-toSourceRelation mt r@(Relation t _ ft _ _ rt _ _)
-  | mt == tableName t = Just $ r {relTable=t {tableName=sourceCTEName}}
-  | mt == tableName ft = Just $ r {relFTable=t {tableName=sourceCTEName}}
-  | Just mt == (tableName <$> rt) = Just $ r {relLinkTable=(\tbl -> tbl {tableName=sourceCTEName}) <$> rt}
-  | otherwise = Nothing
+-- Build the initial tree with a Depth attribute so when a self join occurs we can differentiate the parent and child tables by having
+-- an alias like "table_depth", this is related to http://github.com/PostgREST/postgrest/issues/987.
+initReadRequest :: QualifiedIdentifier -> [Tree SelectItem] -> ReadRequest
+initReadRequest rootQi =
+  foldr (treeEntry rootDepth) initial
+  where
+    rootDepth = 0
+    rootSchema = qiSchema rootQi
+    rootName = qiName rootQi
+    initial = Node (Select [] rootQi Nothing [] [] [] [] allRange, (rootName, Nothing, Nothing, Nothing, rootDepth)) []
+    treeEntry :: Depth -> Tree SelectItem -> ReadRequest -> ReadRequest
+    treeEntry depth (Node fld@((fn, _),_,alias, embedHint) fldForest) (Node (q, i) rForest) =
+      let nxtDepth = succ depth in
+      case fldForest of
+        [] -> Node (q {select=fld:select q}, i) rForest
+        _  -> Node (q, i) $
+              foldr (treeEntry nxtDepth)
+              (Node (Select [] (QualifiedIdentifier rootSchema fn) Nothing [] [] [] [] allRange,
+                (fn, Nothing, alias, embedHint, nxtDepth)) [])
+              fldForest:rForest
 
 treeRestrictRange :: Maybe Integer -> ReadRequest -> Either ApiRequestError ReadRequest
-treeRestrictRange maxRows_ request = pure $ nodeRestrictRange maxRows_ `fmap` request
+treeRestrictRange maxRows request = pure $ nodeRestrictRange maxRows <$> request
   where
     nodeRestrictRange :: Maybe Integer -> ReadNode -> ReadNode
     nodeRestrictRange m (q@Select {range_=r}, i) = (q{range_=restrictRange m r }, i)
 
-augumentRequestWithJoin :: Schema ->  [Relation] ->  ReadRequest -> Either ApiRequestError ReadRequest
+augumentRequestWithJoin :: Schema -> [Relation] -> ReadRequest -> Either ApiRequestError ReadRequest
 augumentRequestWithJoin schema allRels request =
-  addRelations schema allRels Nothing request
-  >>= addJoinConditions schema Nothing
+  addRels schema allRels Nothing request
+  >>= addJoinConditions Nothing
 
-addRelations :: Schema -> [Relation] -> Maybe ReadRequest -> ReadRequest -> Either ApiRequestError ReadRequest
-addRelations schema allRelations parentNode (Node (query@Select{from=tbl}, (nodeName, _, alias, relationDetail, depth)) forest) =
+addRels :: Schema -> [Relation] -> Maybe ReadRequest -> ReadRequest -> Either ApiRequestError ReadRequest
+addRels schema allRels parentNode (Node (query@Select{from=tbl}, (nodeName, _, alias, hint, depth)) forest) =
   case parentNode of
-    Just (Node (Select{from=parentNodeTable}, _) _) ->
-      let newFrom r = if tbl == nodeName then tableName (relTable r) else tbl
+    Just (Node (Select{from=parentNodeQi}, _) _) ->
+      let newFrom r = if qiName tbl == nodeName then tableQi (relFTable r) else tbl
           newReadNode = (\r -> (query{from=newFrom r}, (nodeName, Just r, alias, Nothing, depth))) <$> rel
-          rel :: Either ApiRequestError Relation
-          rel = note (NoRelationBetween parentNodeTable nodeName) $
-                findRelation schema allRelations nodeName parentNodeTable relationDetail in
+          rel = findRel schema allRels (qiName parentNodeQi) nodeName hint
+      in
       Node <$> newReadNode <*> (updateForest . hush $ Node <$> newReadNode <*> pure forest)
     _ ->
-      let rn = (query, (nodeName, Just r, alias, Nothing, depth))
-          r = Relation t [] t [] Root Nothing Nothing Nothing
-          t = Table schema nodeName Nothing True in -- !!! TODO find another way to get the table from the query
+      let rn = (query, (nodeName, Nothing, alias, Nothing, depth)) in
       Node rn <$> updateForest (Just $ Node rn forest)
   where
     updateForest :: Maybe ReadRequest -> Either ApiRequestError [ReadRequest]
-    updateForest rq = mapM (addRelations schema allRelations rq) forest
+    updateForest rq = mapM (addRels schema allRels rq) forest
 
-findRelation :: Schema -> [Relation] -> NodeName -> TableName -> Maybe RelationDetail -> Maybe Relation
-findRelation schema allRelations nodeTableName parentNodeTableName relationDetail =
-  find (\Relation{relTable, relColumns, relFTable, relFColumns, relType, relLinkTable} ->
-    -- Both relation ends need to be on the exposed schema
-    schema == tableSchema relTable && schema == tableSchema relFTable &&
-    case relationDetail of
-      Nothing ->
-
-        -- (request)        => projects { ..., clients{...} }
-        -- will match
-        -- (relation type)  => parent
-        -- (entity)         => clients  {id}
-        -- (foriegn entity) => projects {client_id}
+-- Finds a relationship between an origin and a target in the request: /origin?select=target(*)
+-- If more than one relationship is found then the request is ambiguous and we return an error.
+-- In that case the request can be disambiguated by adding precision to the target or by using a hint: /origin?select=target!hint(*)
+-- The elements will be matched according to these rules:
+-- origin = table / view
+-- target = table / view / constraint / column-from-origin
+-- hint   = table / view / constraint / column-from-origin / column-from-target
+-- (hint can take table / view values to aid in finding the junction in an m2m relationship)
+findRel :: Schema -> [Relation] -> NodeName -> NodeName -> Maybe EmbedHint -> Either ApiRequestError Relation
+findRel schema allRels origin target hint =
+  case rel of
+    []  -> Left $ NoRelBetween origin target
+    [r] -> Right r
+    rs  ->
+      -- Return error if more than one relationship is found, unless we're in a self reference case.
+      --
+      -- Here we handle a self reference relationship to not cause a breaking change:
+      -- In a self reference we get two relationships with the same foreign key and relTable/relFtable but with different cardinalities(m2o/o2m)
+      -- We output the O2M rel, the M2O rel can be obtained by using the origin column as an embed hint.
+      let [rel0, rel1] = take 2 rs in
+      if length rs == 2 && relConstraint rel0 == relConstraint rel1 && relTable rel0 == relTable rel1 && relFTable rel0 == relFTable rel1
+        then note (NoRelBetween origin target) (find (\r -> relType r == O2M) rs)
+        else Left $ AmbiguousRelBetween origin target rs
+  where
+    matchFKSingleCol hint_ cols = length cols == 1 && hint_ == (colName <$> head cols)
+    rel = filter (
+      \Relation{relTable, relColumns, relConstraint, relFTable, relFColumns, relType, relJunction} ->
+        -- Both relationship ends need to be on the exposed schema
+        schema == tableSchema relTable && schema == tableSchema relFTable &&
         (
-          nodeTableName == tableName relTable && -- match relation table name
-          parentNodeTableName == tableName relFTable -- match relation foreign table name
-        ) ||
+          -- /projects?select=clients(*)
+          origin == tableName relTable  &&  -- projects
+          target == tableName relFTable ||  -- clients
 
-        -- (request)        => projects { ..., client_id{...} }
-        -- will match
-        -- (relation type)  => parent
-        -- (entity)         => clients  {id}
-        -- (foriegn entity) => projects {client_id}
-        (
-          parentNodeTableName == tableName relFTable &&
-          length relFColumns == 1 &&
-          -- match common foreign key names(table_name_id, table_name_fk) to table_name
-          (toS ("^" <> colName (unsafeHead relFColumns) <> "_?(?:|[iI][dD]|[fF][kK])$") :: BS.ByteString) =~ (toS nodeTableName :: BS.ByteString)
+          -- /projects?select=projects_client_id_fkey(*)
+          (
+            origin == tableName relTable && -- projects
+            Just target == relConstraint    -- projects_client_id_fkey
+          ) ||
+          -- /projects?select=client_id(*)
+          (
+            origin == tableName relTable &&           -- projects
+            matchFKSingleCol (Just target) relColumns -- client_id
+          )
+        ) && (
+          isNothing hint || -- hint is optional
+
+          -- /projects?select=clients!projects_client_id_fkey(*)
+          hint == relConstraint             || -- projects_client_id_fkey
+
+          -- /projects?select=clients!client_id(*) or /projects?select=clients!id(*)
+          matchFKSingleCol hint relColumns  || -- client_id
+          matchFKSingleCol hint relFColumns || -- id
+
+          -- /users?select=tasks!users_tasks(*)
+          (
+            relType == M2M &&                              -- many-to-many between users and tasks
+            hint == (tableName . junTable <$> relJunction) -- users_tasks
+          )
         )
-
-        -- (request)        => project_id { ..., client_id{...} }
-        -- will match
-        -- (relation type)  => parent
-        -- (entity)         => clients  {id}
-        -- (foriegn entity) => projects {client_id}
-        -- this case works becasue before reaching this place
-        -- addRelation will turn project_id to project so the above condition will match
-
-      Just rd ->
-
-        -- (request)        => clients { ..., projects.client_id{...} }
-        -- will match
-        -- (relation type)  => child
-        -- (entity)         => clients  {id}
-        -- (foriegn entity) => projects {client_id}
-        (
-          relType == Child &&
-          nodeTableName == tableName relTable && -- match relation table name
-          parentNodeTableName == tableName relFTable && -- match relation foreign table name
-          length relColumns == 1 &&
-          rd == colName (unsafeHead relColumns)
-        ) ||
-
-        -- (request)        => message { ..., person_detail.sender{...} }
-        -- will match
-        -- (relation type)  => parent
-        -- (entity)         => message  {sender}
-        -- (foriegn entity) => person_detail {id}
-        (
-          relType == Parent &&
-          nodeTableName == tableName relTable && -- match relation table name
-          parentNodeTableName == tableName relFTable && -- match relation foreign table name
-          length relFColumns == 1 &&
-          rd == colName (unsafeHead relFColumns)
-        ) ||
-
-        -- (request)        => tasks { ..., users.tasks_users{...} }
-        -- will match
-        -- (relation type)  => many
-        -- (entity)         => users
-        -- (foriegn entity) => tasks
-        (
-          relType == Many &&
-          nodeTableName == tableName relTable && -- match relation table name
-          parentNodeTableName == tableName relFTable && -- match relation foreign table name
-          rd == tableName (fromJust relLinkTable)
-        )
-  ) allRelations
+      ) allRels
 
 -- previousAlias is only used for the case of self joins
-addJoinConditions :: Schema -> Maybe Alias -> ReadRequest -> Either ApiRequestError ReadRequest
-addJoinConditions schema previousAlias (Node node@(query@Select{from=tbl}, nodeProps@(_, relation, _, _, depth)) forest) =
-  case relation of
-    Just Relation{relType=Root} -> Node node <$> updatedForest -- this is the root node
-    Just rel@Relation{relType=Parent} -> Node (augmentQuery rel, nodeProps) <$> updatedForest
-    Just rel@Relation{relType=Child} -> Node (augmentQuery rel, nodeProps) <$> updatedForest
-    Just rel@Relation{relType=Many, relLinkTable=(Just linkTable)} ->
-      let rq = augmentQuery rel in
-      Node (rq{implicitJoins=tableName linkTable:implicitJoins rq}, nodeProps) <$> updatedForest
-    _ -> Left UnknownRelation
+addJoinConditions :: Maybe Alias -> ReadRequest -> Either ApiRequestError ReadRequest
+addJoinConditions previousAlias (Node node@(query@Select{from=tbl}, nodeProps@(_, rel, _, _, depth)) forest) =
+  case rel of
+    Just r@Relation{relType=O2M} -> Node (augmentQuery r, nodeProps) <$> updatedForest
+    Just r@Relation{relType=M2O} -> Node (augmentQuery r, nodeProps) <$> updatedForest
+    Just r@Relation{relType=M2M, relJunction=junction} ->
+      case junction of
+        Just Junction{junTable} ->
+          let rq = augmentQuery r in
+          Node (rq{implicitJoins=tableQi junTable:implicitJoins rq}, nodeProps) <$> updatedForest
+        Nothing ->
+          Left UnknownRelation
+    Nothing -> Node node <$> updatedForest
   where
-    newAlias = case isSelfJoin <$> relation of
+    newAlias = case isSelfReference <$> rel of
       Just True
-        | depth /= 0 -> Just (tbl <> "_" <> show depth) -- root node doesn't get aliased
+        | depth /= 0 -> Just (qiName tbl <> "_" <> show depth) -- root node doesn't get aliased
         | otherwise  -> Nothing
       _              -> Nothing
-    augmentQuery rel =
+    augmentQuery r =
       foldr
         (\jc rq@Select{joinConditions=jcs} -> rq{joinConditions=jc:jcs})
         query{fromAlias=newAlias}
-        (getJoinConditions previousAlias newAlias rel)
-    updatedForest = mapM (addJoinConditions schema newAlias) forest
+        (getJoinConditions previousAlias newAlias r)
+    updatedForest = mapM (addJoinConditions newAlias) forest
 
 -- previousAlias and newAlias are used in the case of self joins
 getJoinConditions :: Maybe Alias -> Maybe Alias -> Relation -> [JoinCondition]
-getJoinConditions previousAlias newAlias (Relation Table{tableSchema=tSchema, tableName=tN} cols Table{tableName=ftN} fCols typ lt lc1 lc2) =
+getJoinConditions previousAlias newAlias (Relation Table{tableSchema=tSchema, tableName=tN} cols _ Table{tableName=ftN} fCols typ jun) =
   case typ of
-    Child  ->
+    O2M ->
         zipWith (toJoinCondition tN ftN) cols fCols
-    Parent ->
+    M2O ->
         zipWith (toJoinCondition tN ftN) cols fCols
-    Many   ->
-        let ltN = maybe "" tableName lt in
-        zipWith (toJoinCondition tN ltN) cols (fromMaybe [] lc1) ++ zipWith (toJoinCondition ftN ltN) fCols (fromMaybe [] lc2)
-    Root   -> witness
+    M2M -> case jun of
+        Just (Junction jt _ jc1 _ jc2) ->
+          let jtn = tableName jt in
+          zipWith (toJoinCondition tN jtn) cols jc1 ++ zipWith (toJoinCondition ftN jtn) fCols jc2
+        Nothing -> []
   where
     toJoinCondition :: Text -> Text -> Column -> Column -> JoinCondition
     toJoinCondition tb ftb c fc =
-      let qi1 = QualifiedIdentifier tSchema tb
-          qi2 = QualifiedIdentifier tSchema ftb in
-        JoinCondition (maybe qi1 (QualifiedIdentifier mempty) newAlias, colName c)
-                      (maybe qi2 (QualifiedIdentifier mempty) previousAlias, colName fc)
+      let qi1 = removeSourceCTESchema tSchema tb
+          qi2 = removeSourceCTESchema tSchema ftb in
+        JoinCondition (maybe qi1 (QualifiedIdentifier mempty) previousAlias, colName c)
+                      (maybe qi2 (QualifiedIdentifier mempty) newAlias, colName fc)
+
+    -- On mutation and calling proc cases we wrap the target table in a WITH {sourceCTEName}
+    -- if this happens remove the schema `FROM "schema"."{sourceCTEName}"` and use only the
+    -- `FROM "{sourceCTEName}"`. If the schema remains the FROM would be invalid.
+    removeSourceCTESchema :: Schema -> TableName -> QualifiedIdentifier
+    removeSourceCTESchema schema tbl = QualifiedIdentifier (if tbl == sourceCTEName then mempty else schema) tbl
 
 addFiltersOrdersRanges :: ApiRequest -> Either ApiRequestError (ReadRequest -> ReadRequest)
 addFiltersOrdersRanges apiRequest = foldr1 (liftA2 (.)) [
@@ -266,7 +235,7 @@ addFiltersOrdersRanges apiRequest = foldr1 (liftA2 (.)) [
   ]
   {-
   The esence of what is going on above is that we are composing tree functions
-  of type (ReadRequest->ReadRequest) that are in (Either ParseError a) context
+  of type (ReadRequest->ReadRequest) that are in (Either ApiRequestError a) context
   -}
   where
     filters :: Either ApiRequestError [(EmbedPath, Filter)]
@@ -278,7 +247,7 @@ addFiltersOrdersRanges apiRequest = foldr1 (liftA2 (.)) [
     (flts, logFrst) =
       case action of
         ActionInvoke _ -> (iFilters apiRequest, iLogic apiRequest)
-        ActionRead     -> (iFilters apiRequest, iLogic apiRequest)
+        ActionRead _   -> (iFilters apiRequest, iLogic apiRequest)
         _              -> join (***) (filter (( "." `isInfixOf` ) . fst)) (iFilters apiRequest, iLogic apiRequest)
     orders :: Either ApiRequestError [(EmbedPath, [OrderTerm])]
     orders = mapM pRequestOrder $ iOrder apiRequest
@@ -318,11 +287,15 @@ addProperty f (targetNodeName:remainingPath, a) (Node rn forest) =
   where
     pathNode = find (\(Node (_,(nodeName,_,alias,_,_)) _) -> nodeName == targetNodeName || alias == Just targetNodeName) forest
 
-mutateRequest :: ApiRequest -> TableName -> S.Set FieldName -> [FieldName] -> [FieldName] -> Either Response MutateRequest
-mutateRequest apiRequest tName cols pkCols fldNames = mapLeft errorResponseFor $
+mutateRequest :: Schema -> TableName -> ApiRequest -> S.Set FieldName -> [FieldName] -> ReadRequest -> Either Response MutateRequest
+mutateRequest schema tName apiRequest cols pkCols readReq = mapLeft errorResponseFor $
   case action of
-    ActionCreate -> Right $ Insert tName cols ((,) <$> iPreferResolution apiRequest <*> Just pkCols) [] returnings
-    ActionUpdate -> Update tName cols <$> combinedLogic <*> pure returnings
+    ActionCreate -> do
+        confCols <- case iOnConflict apiRequest of
+            Nothing    -> pure pkCols
+            Just param -> pRequestOnConflict param
+        pure $ Insert qi cols ((,) <$> iPreferResolution apiRequest <*> Just confCols) [] returnings
+    ActionUpdate -> Update qi cols <$> combinedLogic <*> pure returnings
     ActionSingleUpsert ->
       (\flts ->
         if null (iLogic apiRequest) &&
@@ -331,14 +304,18 @@ mutateRequest apiRequest tName cols pkCols fldNames = mapLeft errorResponseFor $
            all (\case
               Filter _ (OpExpr False (Op "eq" _)) -> True
               _ -> False) flts
-          then Insert tName cols (Just (MergeDuplicates, pkCols)) <$> combinedLogic <*> pure returnings
+          then Insert qi cols (Just (MergeDuplicates, pkCols)) <$> combinedLogic <*> pure returnings
         else
           Left InvalidFilters) =<< filters
-    ActionDelete -> Delete tName <$> combinedLogic <*> pure returnings
+    ActionDelete -> Delete qi <$> combinedLogic <*> pure returnings
     _            -> Left UnsupportedVerb
   where
+    qi = QualifiedIdentifier schema tName
     action = iAction apiRequest
-    returnings = if iPreferRepresentation apiRequest == None then [] else fldNames
+    returnings =
+      if iPreferRepresentation apiRequest == None
+        then []
+        else returningCols readReq
     filters = map snd <$> mapM pRequestFilter mutateFilters
     logic = map snd <$> mapM pRequestLogicTree logicFilters
     combinedLogic = foldr addFilterToLogicForest <$> logic <*> filters
@@ -346,13 +323,26 @@ mutateRequest apiRequest tName cols pkCols fldNames = mapLeft errorResponseFor $
     (mutateFilters, logicFilters) = join (***) onlyRoot (iFilters apiRequest, iLogic apiRequest)
     onlyRoot = filter (not . ( "." `isInfixOf` ) . fst)
 
-fieldNames :: ReadRequest -> [FieldName]
-fieldNames (Node (sel, _) forest) =
-  map (fst . view _1) (select sel) ++ map colName fks
+returningCols :: ReadRequest -> [FieldName]
+returningCols rr@(Node _ forest) = returnings
   where
-    fks = concatMap (fromMaybe [] . f) forest
-    f (Node (_, (_, Just Relation{relFColumns=cols, relType=Parent}, _, _, _)) _) = Just cols
-    f _ = Nothing
+    fldNames = fstFieldNames rr
+    -- Without fkCols, when a mutateRequest to /projects?select=name,clients(name) occurs, the RETURNING SQL part would be
+    -- `RETURNING name`(see QueryBuilder).
+    -- This would make the embedding fail because the following JOIN would need the "client_id" column from projects.
+    -- So this adds the foreign key columns to ensure the embedding succeeds, result would be `RETURNING name, client_id`.
+    -- This also works for the other relType's.
+    fkCols = concat $ mapMaybe (\case
+        Node (_, (_, Just Relation{relColumns=cols, relType=relTyp}, _, _, _)) _ -> case relTyp of
+          O2M -> Just cols
+          M2O -> Just cols
+          M2M -> Just cols
+        _ -> Nothing
+      ) forest
+    -- However if the "client_id" is present, e.g. mutateRequest to /projects?select=client_id,name,clients(name)
+    -- we would get `RETURNING client_id, name, client_id` and then we would produce the "column reference \"client_id\" is ambiguous"
+    -- error from PostgreSQL. So we deduplicate with Set:
+    returnings = S.toList . S.fromList $ fldNames ++ (colName <$> fkCols)
 
 -- Traditional filters(e.g. id=eq.1) are added as root nodes of the LogicTree
 -- they are later concatenated with AND in the QueryBuilder

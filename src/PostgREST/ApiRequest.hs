@@ -3,13 +3,14 @@ Module      : PostgREST.ApiRequest
 Description : PostgREST functions to translate HTTP request to a domain type called ApiRequest.
 -}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MultiWayIf #-}
 
 module PostgREST.ApiRequest (
   ApiRequest(..)
+, InvokeMethod(..)
 , ContentType(..)
 , Action(..)
 , Target(..)
-, PreferRepresentation (..)
 , mutuallyAgreeable
 , userApiRequest
 ) where
@@ -51,20 +52,19 @@ import Protolude
 
 type RequestBody = BL.ByteString
 
+data InvokeMethod = InvHead | InvGet | InvPost deriving Eq
 -- | Types of things a user wants to do to tables/views/procs
-data Action = ActionCreate  | ActionRead
-            | ActionUpdate  | ActionDelete
-            | ActionInfo    | ActionInvoke{isReadOnly :: Bool}
-            | ActionInspect | ActionSingleUpsert
+data Action = ActionCreate       | ActionRead{isHead :: Bool}
+            | ActionUpdate       | ActionDelete
+            | ActionSingleUpsert | ActionInvoke InvokeMethod
+            | ActionInfo         | ActionInspect{isHead :: Bool}
             deriving Eq
 -- | The target db object of a user action
 data Target = TargetIdent QualifiedIdentifier
             | TargetProc{tpQi :: QualifiedIdentifier, tpIsRootSpec :: Bool}
-            | TargetDefaultSpec -- The default spec offered at root "/"
+            | TargetDefaultSpec{tdsSchema :: Schema} -- The default spec offered at root "/"
             | TargetUnknown [Text]
             deriving Eq
--- | How to return the inserted data
-data PreferRepresentation = Full | HeadersOnly | None deriving Eq
 
 {-|
   Describes what the user wants to do. This data type is a
@@ -74,83 +74,80 @@ data PreferRepresentation = Full | HeadersOnly | None deriving Eq
   if it is an action we are able to perform.
 -}
 data ApiRequest = ApiRequest {
-  -- | Similar but not identical to HTTP verb, e.g. Create/Invoke both POST
-    iAction                      :: Action
-  -- | Requested range of rows within response
-  , iRange                       :: M.HashMap ByteString NonnegRange
-  -- | The target, be it calling a proc or accessing a table
-  , iTarget                      :: Target
-  -- | Content types the client will accept, [CTAny] if no Accept header
-  , iAccepts                     :: [ContentType]
-  -- | Data sent by client and used for mutation actions
-  , iPayload                     :: Maybe PayloadJSON
-  -- | If client wants created items echoed back
-  , iPreferRepresentation        :: PreferRepresentation
-  -- | Pass all parameters as a single json object to a stored procedure
-  , iPreferSingleObjectParameter :: Bool
-  -- | Whether the client wants a result count (slower)
-  , iPreferCount                 :: Bool
-  -- | Whether the client wants to UPSERT or ignore records on PK conflict
-  , iPreferResolution            :: Maybe PreferResolution
-  -- | Filters on the result ("id", "eq.10")
-  , iFilters                     :: [(Text, Text)]
-  -- | &and and &or parameters used for complex boolean logic
-  , iLogic                       :: [(Text, Text)]
-  -- | &select parameter used to shape the response
-  , iSelect                      :: Text
-  -- | &columns parameter used to shape the payload
-  , iColumns                     :: Maybe Text
-  -- | &order parameters for each level
-  , iOrder                       :: [(Text, Text)]
-  -- | Alphabetized (canonical) request query string for response URLs
-  , iCanonicalQS                 :: ByteString
-  -- | JSON Web Token
-  , iJWT                         :: Text
-  -- | HTTP request headers
-  , iHeaders                     :: [(Text, Text)]
-  -- | Request Cookies
-  , iCookies                     :: [(Text, Text)]
+    iAction               :: Action                           -- ^ Similar but not identical to HTTP verb, e.g. Create/Invoke both POST
+  , iRange                :: M.HashMap ByteString NonnegRange -- ^ Requested range of rows within response
+  , iTopLevelRange        :: NonnegRange                      -- ^ Requested range of rows from the top level
+  , iTarget               :: Target                           -- ^ The target, be it calling a proc or accessing a table
+  , iAccepts              :: [ContentType]                    -- ^ Content types the client will accept, [CTAny] if no Accept header
+  , iPayload              :: Maybe PayloadJSON                -- ^ Data sent by client and used for mutation actions
+  , iPreferRepresentation :: PreferRepresentation             -- ^ If client wants created items echoed back
+  , iPreferParameters     :: Maybe PreferParameters           -- ^ How to pass parameters to a stored procedure
+  , iPreferCount          :: Maybe PreferCount                -- ^ Whether the client wants a result count
+  , iPreferResolution     :: Maybe PreferResolution           -- ^ Whether the client wants to UPSERT or ignore records on PK conflict
+  , iFilters              :: [(Text, Text)]                   -- ^ Filters on the result ("id", "eq.10")
+  , iLogic                :: [(Text, Text)]                   -- ^ &and and &or parameters used for complex boolean logic
+  , iSelect               :: Maybe Text                       -- ^ &select parameter used to shape the response
+  , iOnConflict           :: Maybe Text                       -- ^ &on_conflict parameter used to upsert on specific unique keys
+  , iColumns              :: Maybe Text                       -- ^ &columns parameter used to shape the payload
+  , iOrder                :: [(Text, Text)]                   -- ^ &order parameters for each level
+  , iCanonicalQS          :: ByteString                       -- ^ Alphabetized (canonical) request query string for response URLs
+  , iJWT                  :: Text                             -- ^ JSON Web Token
+  , iHeaders              :: [(Text, Text)]                   -- ^ HTTP request headers
+  , iCookies              :: [(Text, Text)]                   -- ^ Request Cookies
+  , iPath                 :: ByteString                       -- ^ Raw request path
+  , iMethod               :: ByteString                       -- ^ Raw request method
   }
 
 -- | Examines HTTP request and translates it into user intent.
-userApiRequest :: Schema -> Maybe QualifiedIdentifier -> Request -> RequestBody -> Either ApiRequestError ApiRequest
+userApiRequest :: Schema -> Maybe Text -> Request -> RequestBody -> Either ApiRequestError ApiRequest
 userApiRequest schema rootSpec req reqBody
-  | isTargetingProc && method `notElem` ["GET", "POST"] = Left ActionInappropriate
+  | isTargetingProc && method `notElem` ["HEAD", "GET", "POST"] = Left ActionInappropriate
   | topLevelRange == emptyRange = Left InvalidRange
   | shouldParsePayload && isLeft payload = either (Left . InvalidBody . toS) witness payload
   | otherwise = Right ApiRequest {
       iAction = action
       , iTarget = target
       , iRange = ranges
+      , iTopLevelRange = topLevelRange
       , iAccepts = maybe [CTAny] (map decodeContentType . parseHttpAccept) $ lookupHeader "accept"
       , iPayload = relevantPayload
       , iPreferRepresentation = representation
-      , iPreferSingleObjectParameter = singleObject
-      , iPreferCount = hasPrefer "count=exact"
-      , iPreferResolution = if hasPrefer (show MergeDuplicates) then Just MergeDuplicates
-                            else if hasPrefer (show IgnoreDuplicates) then Just IgnoreDuplicates
-                            else Nothing
+      , iPreferParameters = if | hasPrefer (show SingleObject)     -> Just SingleObject
+                               | hasPrefer (show MultipleObjects)  -> Just MultipleObjects
+                               | otherwise                         -> Nothing
+      , iPreferCount      = if | hasPrefer (show ExactCount)     -> Just ExactCount
+                               | hasPrefer (show PlannedCount)   -> Just PlannedCount
+                               | hasPrefer (show EstimatedCount) -> Just EstimatedCount
+                               | otherwise                         -> Nothing
+      , iPreferResolution = if | hasPrefer (show MergeDuplicates)  -> Just MergeDuplicates
+                               | hasPrefer (show IgnoreDuplicates) -> Just IgnoreDuplicates
+                               | otherwise                         -> Nothing
       , iFilters = filters
       , iLogic = [(toS k, toS $ fromJust v) | (k,v) <- qParams, isJust v, endingIn ["and", "or"] k ]
-      , iSelect = toS $ fromMaybe "*" $ join $ lookup "select" qParams
+      , iSelect = toS <$> join (lookup "select" qParams)
+      , iOnConflict = toS <$> join (lookup "on_conflict" qParams)
       , iColumns = columns
       , iOrder = [(toS k, toS $ fromJust v) | (k,v) <- qParams, isJust v, endingIn ["order"] k ]
       , iCanonicalQS = toS $ urlEncodeVars
         . L.sortOn fst
         . map (join (***) toS . second (fromMaybe BS.empty))
-        $ queryStringWPlus
+        $ qString
       , iJWT = tokenStr
-      , iHeaders = [ (toS $ CI.foldedCase k, toS v) | (k,v) <- hdrs, k /= hAuthorization, k /= hCookie]
+      , iHeaders = [ (toS $ CI.foldedCase k, toS v) | (k,v) <- hdrs, k /= hCookie]
       , iCookies = maybe [] parseCookiesText $ lookupHeader "Cookie"
+      , iPath = rawPathInfo req
+      , iMethod = method
       }
  where
-  -- queryString with '+' not converted to ' '
-  queryStringWPlus = parseQueryReplacePlus False $ rawQueryString req
+  -- queryString with '+' converted to ' '(space)
+  qString = parseQueryReplacePlus True $ rawQueryString req
   -- rpcQParams = Rpc query params e.g. /rpc/name?param1=val1, similar to filter but with no operator(eq, lt..)
   (filters, rpcQParams) =
     case action of
-      ActionInvoke{isReadOnly=True} -> partition (liftM2 (||) (isEmbedPath . fst) (hasOperator . snd)) flts
-      _ -> (flts, [])
+      ActionInvoke InvGet  -> partitionFlts
+      ActionInvoke InvHead -> partitionFlts
+      _                    -> (flts, [])
+  partitionFlts = partition (liftM2 (||) (isEmbedPath . fst) (hasOperator . snd)) flts
   flts =
     [ (toS k, toS $ fromJust v) |
       (k,v) <- qParams, isJust v,
@@ -163,13 +160,17 @@ userApiRequest schema rootSpec req reqBody
   isTargetingProc = case target of
     TargetProc _ _ -> True
     _              -> False
+  isTargetingDefaultSpec = case target of
+    TargetDefaultSpec _ -> True
+    _                   -> False
   contentType = decodeContentType . fromMaybe "application/json" $ lookupHeader "content-type"
-  columns | action `elem` [ActionCreate, ActionUpdate, ActionInvoke{isReadOnly=False}] = toS <$> join (lookup "columns" qParams)
-          | otherwise = Nothing
+  columns
+    | action `elem` [ActionCreate, ActionUpdate, ActionInvoke InvPost] = toS <$> join (lookup "columns" qParams)
+    | otherwise = Nothing
   payload =
     case (contentType, action) of
-      (_, ActionInvoke{isReadOnly=True}) ->
-        Right $ ProcessedJSON (JSON.encode $ M.fromList $ second JSON.toJSON <$> rpcQParams) PJObject (S.fromList $ fst <$> rpcQParams)
+      (_, ActionInvoke InvGet)  -> Right rpcPrmsToJson
+      (_, ActionInvoke InvHead) -> Right rpcPrmsToJson
       (CTApplicationJSON, _) ->
         if isJust columns
           then Right $ RawJSON reqBody
@@ -186,47 +187,61 @@ userApiRequest schema rootSpec req reqBody
         Right $ ProcessedJSON (JSON.encode json) PJObject keys
       (ct, _) ->
         Left $ toS $ "Content-Type not acceptable: " <> toMime ct
-  topLevelRange = fromMaybe allRange $ M.lookup "limit" ranges
+  rpcPrmsToJson = ProcessedJSON (JSON.encode $ M.fromList $ second JSON.toJSON <$> rpcQParams)
+                  PJObject (S.fromList $ fst <$> rpcQParams)
+  topLevelRange = fromMaybe allRange $ M.lookup "limit" ranges -- if no limit is specified, get all the request rows
   action =
     case method of
-      "GET"      | target == TargetDefaultSpec -> ActionInspect
-                 | isTargetingProc -> ActionInvoke{isReadOnly=True}
-                 | otherwise -> ActionRead
-
+      -- The HEAD method is identical to GET except that the server MUST NOT return a message-body in the response
+      -- From https://www.w3.org/Protocols/rfc2616/rfc2616-sec9.html#sec9.4
+      "HEAD"     | isTargetingDefaultSpec -> ActionInspect{isHead=True}
+                 | isTargetingProc        -> ActionInvoke InvHead
+                 | otherwise              -> ActionRead{isHead=True}
+      "GET"      | isTargetingDefaultSpec -> ActionInspect{isHead=False}
+                 | isTargetingProc        -> ActionInvoke InvGet
+                 | otherwise              -> ActionRead{isHead=False}
       "POST"    -> if isTargetingProc
-                    then ActionInvoke{isReadOnly=False}
+                    then ActionInvoke InvPost
                     else ActionCreate
       "PATCH"   -> ActionUpdate
       "PUT"     -> ActionSingleUpsert
       "DELETE"  -> ActionDelete
       "OPTIONS" -> ActionInfo
-      _         -> ActionInspect
+      _         -> ActionInspect{isHead=False}
   target = case path of
     []            -> case rootSpec of
-                       Just rsQi -> TargetProc rsQi True
-                       Nothing   -> TargetDefaultSpec
+                       Just pName -> TargetProc (QualifiedIdentifier schema pName) True
+                       Nothing    -> TargetDefaultSpec schema
     [table]       -> TargetIdent $ QualifiedIdentifier schema table
     ["rpc", proc] -> TargetProc (QualifiedIdentifier schema proc) False
     other         -> TargetUnknown other
 
-  shouldParsePayload = action `elem` [ActionCreate, ActionUpdate, ActionSingleUpsert, ActionInvoke{isReadOnly=False}, ActionInvoke{isReadOnly=True}]
+  shouldParsePayload =
+    action `elem`
+    [ActionCreate, ActionUpdate, ActionSingleUpsert,
+    ActionInvoke InvPost,
+    -- Though ActionInvoke{isGet=True}(a GET /rpc/..) doesn't really have a payload, we use the payload variable as a way
+    -- to store the query string arguments to the function.
+    ActionInvoke InvGet,
+    ActionInvoke InvHead]
   relevantPayload | shouldParsePayload = rightToMaybe payload
                   | otherwise = Nothing
   path            = pathInfo req
   method          = requestMethod req
   hdrs            = requestHeaders req
-  qParams         = [(toS k, v)|(k,v) <- queryStringWPlus]
+  qParams         = [(toS k, v)|(k,v) <- qString]
   lookupHeader    = flip lookup hdrs
   hasPrefer :: Text -> Bool
   hasPrefer val   = any (\(h,v) -> h == "Prefer" && val `elem` split v) hdrs
     where
         split :: BS.ByteString -> [Text]
         split = map T.strip . T.split (==',') . toS
-  singleObject    = hasPrefer "params=single-object"
   representation
-    | hasPrefer "return=representation" = Full
-    | hasPrefer "return=minimal" = None
-    | otherwise = HeadersOnly
+    | hasPrefer (show Full) = Full
+    | hasPrefer (show None) = None
+    | otherwise             = if action == ActionCreate
+                                then HeadersOnly -- Assume the user wants the Location header(for POST) by default
+                                else None
   auth = fromMaybe "" $ lookupHeader hAuthorization
   tokenStr = case T.split (== ' ') (toS auth) of
     ("Bearer" : t : _) -> t

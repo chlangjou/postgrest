@@ -23,7 +23,7 @@ import Test.Hspec.Wai
 import Text.Heredoc
 
 import PostgREST.Config (AppConfig (..))
-import PostgREST.Types  (JSPathExp (..), QualifiedIdentifier (..))
+import PostgREST.Types  (JSPathExp (..))
 import Protolude
 
 matchContentTypeJson :: MatchHeader
@@ -66,6 +66,8 @@ _baseCfg =  -- Connection Settings
   AppConfig mempty "postgrest_test_anonymous" Nothing "test" "localhost" 3000
             -- No user configured Unix Socket
             Nothing
+            -- No user configured Unix Socket file mode (defaults to 660)
+            (Right 432)
             -- Jwt settings
             (Just $ encodeUtf8 "reallyreallyreallyreallyverysafe") False Nothing
             -- Connection Modifiers
@@ -93,11 +95,11 @@ testCfgNoJWT testDbConn = (testCfg testDbConn) { configJwtSecret = Nothing }
 testUnicodeCfg :: Text -> AppConfig
 testUnicodeCfg testDbConn = (testCfg testDbConn) { configSchema = "تست" }
 
-testLtdRowsCfg :: Text -> AppConfig
-testLtdRowsCfg testDbConn = (testCfg testDbConn) { configMaxRows = Just 2 }
+testMaxRowsCfg :: Text -> AppConfig
+testMaxRowsCfg testDbConn = (testCfg testDbConn) { configMaxRows = Just 2 }
 
 testProxyCfg :: Text -> AppConfig
-testProxyCfg testDbConn = (testCfg testDbConn) { configProxyUri = Just "https://postgrest.com/openapi.json" }
+testProxyCfg testDbConn = (testCfg testDbConn) { configOpenAPIProxyUri = Just "https://postgrest.com/openapi.json" }
 
 testCfgBinaryJWT :: Text -> AppConfig
 testCfgBinaryJWT testDbConn = (testCfg testDbConn) {
@@ -131,10 +133,13 @@ testCfgExtraSearchPath :: Text -> AppConfig
 testCfgExtraSearchPath testDbConn = (testCfg testDbConn) { configExtraSearchPath = ["public", "extensions"] }
 
 testCfgRootSpec :: Text -> AppConfig
-testCfgRootSpec testDbConn = (testCfg testDbConn) { configRootSpec = Just $ QualifiedIdentifier "test" "root"}
+testCfgRootSpec testDbConn = (testCfg testDbConn) { configRootSpec = Just "root"}
 
 testCfgHtmlRawOutput :: Text -> AppConfig
 testCfgHtmlRawOutput testDbConn = (testCfg testDbConn) { configRawMediaTypes = ["text/html"] }
+
+testCfgResponseHeaders :: Text -> AppConfig
+testCfgResponseHeaders testDbConn = (testCfg testDbConn) { configReqCheck = Just "custom_headers" }
 
 setupDb :: Text -> IO ()
 setupDb dbConn = do
@@ -148,6 +153,10 @@ setupDb dbConn = do
 
 resetDb :: Text -> IO ()
 resetDb dbConn = loadFixture dbConn "data"
+
+analyzeTable :: Text -> Text -> IO ()
+analyzeTable dbConn tableName =
+  void $ readProcess "psql" ["--set", "ON_ERROR_STOP=1", toS dbConn, "-a", "-c", toS $ "ANALYZE test.\"" <> tableName <> "\""] []
 
 loadFixture :: Text -> FilePath -> IO()
 loadFixture dbConn name =
