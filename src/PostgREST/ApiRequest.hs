@@ -29,6 +29,7 @@ import qualified Data.Vector          as V
 import Control.Arrow             ((***))
 import Data.Aeson.Types          (emptyArray, emptyObject)
 import Data.List                 (last, lookup, partition)
+import Data.List.NonEmpty        (head)
 import Data.Maybe                (fromJust)
 import Data.Ranged.Ranges        (Range (..), emptyRange,
                                   rangeIntersection)
@@ -48,7 +49,8 @@ import PostgREST.RangeQuery (NonnegRange, allRange, rangeGeq,
                              rangeLimit, rangeOffset, rangeRequested,
                              restrictRange)
 import PostgREST.Types
-import Protolude
+import Protolude            hiding (head, toS)
+import Protolude.Conv       (toS)
 
 type RequestBody = BL.ByteString
 
@@ -96,11 +98,14 @@ data ApiRequest = ApiRequest {
   , iCookies              :: [(Text, Text)]                   -- ^ Request Cookies
   , iPath                 :: ByteString                       -- ^ Raw request path
   , iMethod               :: ByteString                       -- ^ Raw request method
+  , iProfile              :: Maybe Schema                     -- ^ The request profile for enabling use of multiple schemas. Follows the spec in hhttps://www.w3.org/TR/dx-prof-conneg/ttps://www.w3.org/TR/dx-prof-conneg/.
+  , iSchema               :: Schema                           -- ^ The request schema. Can vary depending on iProfile.
   }
 
 -- | Examines HTTP request and translates it into user intent.
-userApiRequest :: Schema -> Maybe Text -> Request -> RequestBody -> Either ApiRequestError ApiRequest
-userApiRequest schema rootSpec req reqBody
+userApiRequest :: NonEmpty Schema -> Maybe Text -> Request -> RequestBody -> Either ApiRequestError ApiRequest
+userApiRequest confSchemas rootSpec req reqBody
+  | isJust profile && fromJust profile `notElem` confSchemas = Left $ UnacceptableSchema $ toList confSchemas
   | isTargetingProc && method `notElem` ["HEAD", "GET", "POST"] = Left ActionInappropriate
   | topLevelRange == emptyRange = Left InvalidRange
   | shouldParsePayload && isLeft payload = either (Left . InvalidBody . toS) witness payload
@@ -137,6 +142,8 @@ userApiRequest schema rootSpec req reqBody
       , iCookies = maybe [] parseCookiesText $ lookupHeader "Cookie"
       , iPath = rawPathInfo req
       , iMethod = method
+      , iProfile = profile
+      , iSchema = schema
       }
  where
   -- queryString with '+' converted to ' '(space)
@@ -184,11 +191,10 @@ userApiRequest schema rootSpec req reqBody
       (CTOther "application/x-www-form-urlencoded", _) ->
         let json = M.fromList . map (toS *** JSON.String . toS) . parseSimpleQuery $ toS reqBody
             keys = S.fromList $ M.keys json in
-        Right $ ProcessedJSON (JSON.encode json) PJObject keys
+        Right $ ProcessedJSON (JSON.encode json) keys
       (ct, _) ->
         Left $ toS $ "Content-Type not acceptable: " <> toMime ct
-  rpcPrmsToJson = ProcessedJSON (JSON.encode $ M.fromList $ second JSON.toJSON <$> rpcQParams)
-                  PJObject (S.fromList $ fst <$> rpcQParams)
+  rpcPrmsToJson = ProcessedJSON (JSON.encode $ M.fromList $ second JSON.toJSON <$> rpcQParams) (S.fromList $ fst <$> rpcQParams)
   topLevelRange = fromMaybe allRange $ M.lookup "limit" ranges -- if no limit is specified, get all the request rows
   action =
     case method of
@@ -208,6 +214,18 @@ userApiRequest schema rootSpec req reqBody
       "DELETE"  -> ActionDelete
       "OPTIONS" -> ActionInfo
       _         -> ActionInspect{isHead=False}
+
+  defaultSchema = head confSchemas
+  profile
+    | length confSchemas <= 1 -- only enable content negotiation by profile when there are multiple schemas specified in the config
+      = Nothing
+    | action `elem` [ActionCreate, ActionUpdate, ActionSingleUpsert, ActionDelete, ActionInvoke InvPost] -- POST/PATCH/PUT/DELETE don't use the same header as per the spec
+      = Just $ maybe defaultSchema toS $ lookupHeader "Content-Profile"
+    | action `elem` [ActionRead True, ActionRead False, ActionInvoke InvGet, ActionInvoke InvHead,
+                     ActionInspect False, ActionInspect True, ActionInfo]
+      = Just $ maybe defaultSchema toS $ lookupHeader "Accept-Profile"
+    | otherwise = Nothing
+  schema = fromMaybe defaultSchema profile
   target = case path of
     []            -> case rootSpec of
                        Just pName -> TargetProc (QualifiedIdentifier schema pName) True
@@ -245,6 +263,7 @@ userApiRequest schema rootSpec req reqBody
   auth = fromMaybe "" $ lookupHeader hAuthorization
   tokenStr = case T.split (== ' ') (toS auth) of
     ("Bearer" : t : _) -> t
+    ("bearer" : t : _) -> t
     _                  -> ""
   endingIn:: [Text] -> Text -> Bool
   endingIn xx key = lastWord `elem` xx
@@ -315,14 +334,14 @@ payloadAttributes raw json =
                 JSON.Object x -> S.fromList (M.keys x) == canonicalKeys
                 _ -> False) arr in
           if areKeysUniform
-            then Just $ ProcessedJSON raw (PJArray $ V.length arr) canonicalKeys
+            then Just $ ProcessedJSON raw canonicalKeys
             else Nothing
         Just _ -> Nothing
         Nothing -> Just emptyPJArray
 
-    JSON.Object o -> Just $ ProcessedJSON raw PJObject (S.fromList $ M.keys o)
+    JSON.Object o -> Just $ ProcessedJSON raw (S.fromList $ M.keys o)
 
     -- truncate everything else to an empty array.
     _ -> Just emptyPJArray
   where
-    emptyPJArray = ProcessedJSON (JSON.encode emptyArray) (PJArray 0) S.empty
+    emptyPJArray = ProcessedJSON (JSON.encode emptyArray) S.empty

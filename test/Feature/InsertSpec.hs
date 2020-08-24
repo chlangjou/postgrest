@@ -2,7 +2,6 @@ module Feature.InsertSpec where
 
 import qualified Data.Aeson as JSON
 
-import Control.Monad          (replicateM_, void)
 import Data.List              (lookup)
 import Data.Maybe             (fromJust)
 import Network.Wai            (Application)
@@ -20,7 +19,7 @@ import PostgREST.Types (PgVersion, pgVersion112)
 import Protolude       hiding (get)
 import SpecHelper
 
-spec :: PgVersion -> SpecWith Application
+spec :: PgVersion -> SpecWith ((), Application)
 spec actualPgVersion = do
   describe "Posting new record" $ do
     context "disparate json types" $ do
@@ -47,6 +46,22 @@ spec actualPgVersion = do
           { matchStatus  = 201
           , matchHeaders = [matchContentTypeJson]
           }
+
+      it "ignores &select when return not set or using return=minimal" $ do
+        request methodPost "/menagerie?select=integer,varchar" []
+          [json| [{
+            "integer": 15, "double": 3.14159, "varchar": "testing!"
+          , "boolean": false, "date": "1900-01-01", "money": "$3.99"
+          , "enum": "foo"
+          }] |] `shouldRespondWith` ""
+          { matchStatus  = 201 }
+        request methodPost "/menagerie?select=integer,varchar" [("Prefer", "return=minimal")]
+          [json| [{
+            "integer": 16, "double": 3.14159, "varchar": "testing!"
+          , "boolean": false, "date": "1900-01-01", "money": "$3.99"
+          , "enum": "foo"
+          }] |] `shouldRespondWith` ""
+          { matchStatus  = 201 }
 
     context "non uniform json array" $ do
       it "rejects json array that isn't exclusivily composed of objects" $
@@ -89,6 +104,25 @@ spec actualPgVersion = do
                            , "Content-Range" <:> "*/*" ]
           }
 
+      it "should not throw and return location header when selecting without PK" $
+        request methodPost "/projects?select=name,client_id" [("Prefer", "return=representation")]
+          [str|{"id":10,"name":"New Project","client_id":2}|] `shouldRespondWith`
+          [str|[{"name":"New Project","client_id":2}]|]
+          { matchStatus  = 201
+          , matchHeaders = [ matchContentTypeJson
+                           , "Location" <:> "/projects?id=eq.10"
+                           , "Content-Range" <:> "*/*" ]
+          }
+
+    context "requesting no representation" $
+      it "should not throw and return location header when selecting without PK" $
+        request methodPost "/projects?select=name,client_id" []
+          [str|{"id":11,"name":"New Project","client_id":2}|] `shouldRespondWith` ""
+          { matchStatus  = 201
+          , matchHeaders = [ "Location" <:> "/projects?id=eq.11"
+                           , "Content-Range" <:> "*/*" ]
+          }
+
     context "from an html form" $
       it "accepts disparate json types" $ do
         p <- request methodPost "/menagerie"
@@ -124,11 +158,11 @@ spec actualPgVersion = do
           }
 
       context "into a table with no pk" $ do
-        it "succeeds with 201 and a link including all fields" $ do
+        it "succeeds with 201 but no location header" $ do
           p <- post "/no_pk" [json| { "a":"foo", "b":"bar" } |]
           liftIO $ do
             simpleBody p `shouldBe` ""
-            simpleHeaders p `shouldSatisfy` matchHeader hLocation "/no_pk\\?a=eq.foo&b=eq.bar"
+            lookup hLocation (simpleHeaders p) `shouldBe` Nothing
             simpleStatus p `shouldBe` created201
 
         it "returns full details of inserted record if asked" $ do
@@ -137,7 +171,7 @@ spec actualPgVersion = do
                        [json| { "a":"bar", "b":"baz" } |]
           liftIO $ do
             simpleBody p `shouldBe` [json| [{ "a":"bar", "b":"baz" }] |]
-            simpleHeaders p `shouldSatisfy` matchHeader hLocation "/no_pk\\?a=eq.bar&b=eq.baz"
+            lookup hLocation (simpleHeaders p) `shouldBe` Nothing
             simpleStatus p `shouldBe` created201
 
         it "returns empty array when no items inserted, and return=rep" $ do
@@ -154,7 +188,7 @@ spec actualPgVersion = do
                        [json| { "a":null, "b":"foo" } |]
           liftIO $ do
             simpleBody p `shouldBe` [json| [{ "a":null, "b":"foo" }] |]
-            simpleHeaders p `shouldSatisfy` matchHeader hLocation "/no_pk\\?a=is.null&b=eq.foo"
+            lookup hLocation (simpleHeaders p) `shouldBe` Nothing
             simpleStatus p `shouldBe` created201
 
     context "with compound pk supplied" $
@@ -189,7 +223,16 @@ spec actualPgVersion = do
       it "fails with 400 and error" $
         post "/simple_pk" "}{ x = 2"
         `shouldRespondWith`
-        [json|{"message":"Error in $: Failed reading: not a valid json value"}|]
+        [json|{"message":"Error in $: Failed reading: not a valid json value at '}{x=2'"}|]
+        { matchStatus  = 400
+        , matchHeaders = [matchContentTypeJson]
+        }
+
+    context "with no payload" $
+      it "fails with 400 and error" $
+        post "/simple_pk" ""
+        `shouldRespondWith`
+        [json|{"message":"Error in $: not enough input"}|]
         { matchStatus  = 400
         , matchHeaders = [matchContentTypeJson]
         }
@@ -214,24 +257,20 @@ spec actualPgVersion = do
     context "jsonb" $ do
       it "serializes nested object" $ do
         let inserted = [json| { "data": { "foo":"bar" } } |]
-            location = "/json?data=eq.%7B%22foo%22%3A%22bar%22%7D"
         request methodPost "/json"
                      [("Prefer", "return=representation")]
                      inserted
           `shouldRespondWith` [str|[{"data":{"foo":"bar"}}]|]
           { matchStatus  = 201
-          , matchHeaders = ["Location" <:> location]
           }
 
       it "serializes nested array" $ do
         let inserted = [json| { "data": [1,2,3] } |]
-            location = "/json?data=eq.%5B1%2C2%2C3%5D"
         request methodPost "/json"
                      [("Prefer", "return=representation")]
                      inserted
           `shouldRespondWith` [str|[{"data":[1,2,3]}]|]
           { matchStatus  = 201
-          , matchHeaders = ["Location" <:> location]
           }
 
     context "empty objects" $ do
@@ -249,6 +288,20 @@ spec actualPgVersion = do
         post "/items" "[{}, {}]" `shouldRespondWith` ""
           { matchStatus  = 201
           , matchHeaders = []
+          }
+
+      it "successfully inserts a row with all-default columns with prefer=rep" $
+        request methodPost "/items" [("Prefer", "return=representation")] "{}"
+          `shouldRespondWith` [json|[{ id: 20 }]|]
+          { matchStatus  = 201,
+            matchHeaders = []
+          }
+
+      it "successfully inserts a row with all-default columns with prefer=rep and &select=" $
+        request methodPost "/items?select=id" [("Prefer", "return=representation")] "{}"
+          `shouldRespondWith` [json|[{ id: 21 }]|]
+          { matchStatus  = 201,
+            matchHeaders = []
           }
 
     context "POST with ?columns parameter" $ do
@@ -320,8 +373,7 @@ spec actualPgVersion = do
                      "a,b\nbar,baz"
           `shouldRespondWith` "a,b\nbar,baz"
           { matchStatus  = 201
-          , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8",
-                            "Location" <:> "/no_pk?a=eq.bar&b=eq.baz"]
+          , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8"]
           }
 
       it "can post nulls" $
@@ -330,8 +382,7 @@ spec actualPgVersion = do
                      "a,b\nNULL,foo"
           `shouldRespondWith` "a,b\n,foo"
           { matchStatus  = 201
-          , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8",
-                            "Location" <:> "/no_pk?a=is.null&b=eq.foo"]
+          , matchHeaders = ["Content-Type" <:> "text/csv; charset=utf-8"]
           }
 
       it "only returns the requested column header with its associated data" $
@@ -355,8 +406,8 @@ spec actualPgVersion = do
 
     context "with unicode values" $
       it "succeeds and returns usable location header" $ do
-        let payload = [json| { "a":"圍棋", "b":"￥" } |]
-        p <- request methodPost "/no_pk"
+        let payload = [json| { "k":"圍棋", "extra":"￥" } |]
+        p <- request methodPost "/simple_pk?select=extra,k"
                      [("Prefer", "return=representation")]
                      payload
         liftIO $ do
@@ -364,7 +415,7 @@ spec actualPgVersion = do
           simpleStatus p `shouldBe` created201
 
         let Just location = lookup hLocation $ simpleHeaders p
-        r <- get location
+        r <- get (location <> "&select=extra,k")
         liftIO $ simpleBody r `shouldBe` "["<>payload<>"]"
 
   describe "Patching record" $ do
@@ -381,6 +432,24 @@ spec actualPgVersion = do
           `shouldRespondWith` ""
           { matchStatus  = 404,
             matchHeaders = []
+          }
+
+    context "with invalid json payload" $
+      it "fails with 400 and error" $
+        request methodPatch "/simple_pk" [] "}{ x = 2"
+          `shouldRespondWith`
+          [json|{"message":"Error in $: Failed reading: not a valid json value at '}{x=2'"}|]
+          { matchStatus  = 400,
+            matchHeaders = [matchContentTypeJson]
+          }
+
+    context "with no payload" $
+      it "fails with 400 and error" $
+        request methodPatch "/items" [] ""
+          `shouldRespondWith`
+          [json|{"message":"Error in $: not enough input"}|]
+          { matchStatus  = 400,
+            matchHeaders = [matchContentTypeJson]
           }
 
     context "in a nonempty table" $ do
@@ -464,47 +533,123 @@ spec actualPgVersion = do
               matchHeaders = []
             }
 
-      it "can provide a representation" $ do
-        _ <- post "/items"
-          [json| { id: 1 } |]
-        request methodPatch
-          "/items?id=eq.1"
-          [("Prefer", "return=representation")]
-          [json| { id: 99 } |]
-          `shouldRespondWith` [json| [{id:99}] |]
-          { matchHeaders = [matchContentTypeJson] }
-        -- put value back for other tests
-        void $ request methodPatch "/items?id=eq.99" [] [json| { "id":1 } |]
+      context "with representation requested" $ do
+        it "can provide a representation" $ do
+          _ <- post "/items"
+            [json| { id: 1 } |]
+          request methodPatch
+            "/items?id=eq.1"
+            [("Prefer", "return=representation")]
+            [json| { id: 99 } |]
+            `shouldRespondWith` [json| [{id:99}] |]
+            { matchHeaders = [matchContentTypeJson] }
+          -- put value back for other tests
+          void $ request methodPatch "/items?id=eq.99" [] [json| { "id":1 } |]
 
-      it "makes no updates and returns 204, when patching with an empty json object/array" $ do
-        request methodPatch "/items" [] [json| {} |]
+        it "can return computed columns" $
+          request methodPatch
+            "/items?id=eq.1&select=id,always_true"
+            [("Prefer", "return=representation")]
+            [json| { id: 1 } |]
+            `shouldRespondWith` [json| [{ id: 1, always_true: true }] |]
+            { matchHeaders = [matchContentTypeJson] }
+
+        it "can select overloaded computed columns" $ do
+          request methodPatch
+            "/items?id=eq.1&select=id,computed_overload"
+            [("Prefer", "return=representation")]
+            [json| { id: 1 } |]
+            `shouldRespondWith` [json| [{ id: 1, computed_overload: true }] |]
+            { matchHeaders = [matchContentTypeJson] }
+          request methodPatch
+            "/items2?id=eq.1&select=id,computed_overload"
+            [("Prefer", "return=representation")]
+            [json| { id: 1 } |]
+            `shouldRespondWith` [json| [{ id: 1, computed_overload: true }] |]
+            { matchHeaders = [matchContentTypeJson] }
+
+      it "ignores ?select= when return not set or return=minimal" $ do
+        request methodPatch "/items?id=eq.1&select=id" [] [json| { id:1 } |]
           `shouldRespondWith` ""
           {
             matchStatus  = 204,
-            matchHeaders = ["Content-Range" <:> "*/*"]
+            matchHeaders = ["Content-Range" <:> "0-0/*"]
           }
-
-        request methodPatch "/items" [] [json| [] |]
+        request methodPatch "/items?id=eq.1&select=id" [("Prefer", "return=minimal")] [json| { id:1 } |]
           `shouldRespondWith` ""
           {
             matchStatus  = 204,
-            matchHeaders = ["Content-Range" <:> "*/*"]
+            matchHeaders = ["Content-Range" <:> "0-0/*"]
           }
 
-        request methodPatch "/items" [] [json| [{}] |]
-          `shouldRespondWith` ""
-          {
-            matchStatus  = 204,
-            matchHeaders = ["Content-Range" <:> "*/*"]
-          }
+      context "when patching with an empty body" $ do
+        it "makes no updates and returns 204 without return= and without ?select=" $ do
+          request methodPatch "/items" [] [json| {} |]
+            `shouldRespondWith` ""
+            {
+              matchStatus  = 204,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
 
-      it "makes no updates and returns 200, when patching with an empty json object and return=rep" $
-        request methodPatch "/items" [("Prefer", "return=representation")] [json| {} |]
-          `shouldRespondWith` "[]"
-          {
-            matchStatus  = 200,
-            matchHeaders = ["Content-Range" <:> "*/*"]
-          }
+          request methodPatch "/items" [] [json| [] |]
+            `shouldRespondWith` ""
+            {
+              matchStatus  = 204,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
+
+          request methodPatch "/items" [] [json| [{}] |]
+            `shouldRespondWith` ""
+            {
+              matchStatus  = 204,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
+
+        it "makes no updates and returns 204 without return= and with ?select=" $ do
+          request methodPatch "/items?select=id" [] [json| {} |]
+            `shouldRespondWith` ""
+            {
+              matchStatus  = 204,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
+
+          request methodPatch "/items?select=id" [] [json| [] |]
+            `shouldRespondWith` ""
+            {
+              matchStatus  = 204,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
+
+          request methodPatch "/items?select=id" [] [json| [{}] |]
+            `shouldRespondWith` ""
+            {
+              matchStatus  = 204,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
+
+        it "makes no updates and returns 200 with return=rep and without ?select=" $
+          request methodPatch "/items" [("Prefer", "return=representation")] [json| {} |]
+            `shouldRespondWith` "[]"
+            {
+              matchStatus  = 200,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
+
+        it "makes no updates and returns 200 with return=rep and with ?select=" $
+          request methodPatch "/items?select=id" [("Prefer", "return=representation")] [json| {} |]
+            `shouldRespondWith` "[]"
+            {
+              matchStatus  = 200,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
+
+        it "makes no updates and returns 200 with return=rep and with ?select= for overloaded computed columns" $
+          request methodPatch "/items?select=id,computed_overload" [("Prefer", "return=representation")] [json| {} |]
+            `shouldRespondWith` "[]"
+            {
+              matchStatus  = 200,
+              matchHeaders = ["Content-Range" <:> "*/*"]
+            }
 
     context "with unicode values" $
       it "succeeds and returns values intact" $ do
@@ -561,7 +706,7 @@ spec actualPgVersion = do
         , matchHeaders = [ matchContentTypeJson , "Location" <:> "/web_content?id=eq.6" ]
         }
 
-    it "embeds childs after update" $
+    it "embeds children after update" $
       request methodPatch "/web_content?id=eq.0&select=id,name,web_content(name)"
               [("Prefer", "return=representation")]
         [json|{"name": "tardis-patched"}|]
@@ -573,7 +718,7 @@ spec actualPgVersion = do
           matchHeaders = [matchContentTypeJson]
         }
 
-    it "embeds parent, childs and grandchilds after update" $
+    it "embeds parent, children and grandchildren after update" $
       request methodPatch "/web_content?id=eq.0&select=id,name,web_content(name,web_content(name)),parent_content:p_web_id(name)"
               [("Prefer", "return=representation")]
         [json|{"name": "tardis-patched-2"}|]
@@ -594,7 +739,7 @@ spec actualPgVersion = do
           matchHeaders = [matchContentTypeJson]
         }
 
-    it "embeds childs after update without explicitly including the id in the ?select" $
+    it "embeds children after update without explicitly including the id in the ?select" $
       request methodPatch "/web_content?id=eq.0&select=name,web_content(name)"
               [("Prefer", "return=representation")]
         [json|{"name": "tardis-patched"}|]

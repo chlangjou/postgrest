@@ -1,7 +1,6 @@
 module Feature.UnicodeSpec where
 
-import Control.Monad (void)
-import Network.Wai   (Application)
+import Network.Wai (Application)
 
 import Test.Hspec
 import Test.Hspec.Wai
@@ -10,7 +9,7 @@ import Test.Hspec.Wai.JSON
 import Protolude  hiding (get)
 import SpecHelper
 
-spec :: SpecWith Application
+spec :: SpecWith ((), Application)
 spec =
   describe "Reading and writing to unicode schema and table names" $
     it "Can read and write values" $ do

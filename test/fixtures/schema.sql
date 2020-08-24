@@ -18,6 +18,8 @@ CREATE SCHEMA private;
 CREATE SCHEMA test;
 CREATE SCHEMA تست;
 CREATE SCHEMA extensions;
+CREATE SCHEMA v1;
+CREATE SCHEMA v2;
 
 --
 -- Name: plpgsql; Type: EXTENSION; Schema: -; Owner: -
@@ -107,7 +109,25 @@ CREATE TABLE items (
     id bigserial primary key
 );
 
+CREATE TABLE items2 (
+    id bigserial primary key
+);
+
+CREATE FUNCTION search(id BIGINT) RETURNS SETOF items
+    LANGUAGE plpgsql
+    AS $$BEGIN
+        RETURN QUERY SELECT items.id FROM items WHERE items.id=search.id;
+    END$$;
+
 CREATE FUNCTION always_true(test.items) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$ SELECT true $$;
+
+CREATE FUNCTION computed_overload(test.items) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$ SELECT true $$;
+
+CREATE FUNCTION computed_overload(test.items2) RETURNS boolean
     LANGUAGE sql STABLE
     AS $$ SELECT true $$;
 
@@ -1066,6 +1086,20 @@ begin
 end;
 $$ language plpgsql;
 
+create or replace function test.send_body_status_403() returns pg_catalog.json as $$
+begin
+  perform set_config('response.status', '403', true);
+  return json_build_object('message', 'invalid user or password');
+end;
+$$ language plpgsql;
+
+create or replace function test.send_bad_status() returns pg_catalog.json as $$
+begin
+  perform set_config('response.status', 'bad', true);
+  return null;
+end;
+$$ language plpgsql;
+
 create or replace function test.get_projects_and_guc_headers() returns setof test.projects as $$
   set local "response.headers" = '[{"X-Test": "key1=val1; someValue; key2=val2"}, {"X-Test-2": "key1=val1"}]';
   select * from test.projects;
@@ -1672,8 +1706,7 @@ create table private.stuff(
 
 create view test.stuff as select * from private.stuff;
 
-create or replace function location_for_stuff() returns trigger
-    as $$
+create or replace function location_for_stuff() returns trigger as $$
 begin
     insert into private.stuff values (new.id, new.name);
     if new.id is not null
@@ -1681,10 +1714,66 @@ begin
       perform set_config(
         'response.headers'
       , format('[{"Location": "/%s?id=eq.%s&overriden=true"}]', tg_table_name, new.id)
-      , false
+      , true
       );
     end if;
     return new;
 end
 $$ language plpgsql security definer;
 create trigger location_for_stuff instead of insert on test.stuff for each row execute procedure test.location_for_stuff();
+
+create or replace function status_205_for_updated_stuff() returns trigger as $$
+begin
+    update private.stuff set id = new.id, name = new.name;
+    perform set_config('response.status' , '205' , true);
+    return new;
+end
+$$ language plpgsql security definer;
+create trigger status_205_for_updated_stuff instead of update on test.stuff for each row execute procedure test.status_205_for_updated_stuff();
+
+create table loc_test (
+  id int primary key
+, c text
+);
+
+-- tables to test multi schema access in one instance
+create table v1.parents (
+  id    int primary key
+, name text
+);
+
+create table v1.children (
+  id       serial primary key
+, name    text
+, parent_id int
+, constraint parent foreign key(parent_id)
+  references v1.parents(id)
+);
+
+create function v1.get_parents_below(id int)
+returns setof v1.parents as $$
+  select * from v1.parents where id < $1;
+$$ language sql;
+
+create table v2.parents (
+  id    int primary key
+, name text
+);
+
+create table v2.children (
+  id    serial primary key
+, name text
+, parent_id int
+, constraint parent foreign key(parent_id)
+  references v2.parents(id)
+);
+
+create table v2.another_table (
+  id            int primary key
+, another_value text
+);
+
+create function v2.get_parents_below(id int)
+returns setof v2.parents as $$
+  select * from v2.parents where id < $1;
+$$ language sql;

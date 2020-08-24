@@ -7,16 +7,53 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 
 ### Added
 
+ - #1525, Allow http status override through response.status guc - @steve-chavez
+ - #1512, Allow schema cache reloading with NOTIFY - @steve-chavez
+ - #1119, Allow config file reloading with SIGUSR2 - @steve-chavez
+ - #1558, Allow 'Bearer' with and without capitalization as authentication schema - @wolfgangwalther
+ - #1559, No downtime when reloading the schema cache with SIGUSR1 - @steve-chavez
+
+### Fixed
+
+ - #1530, Fix how the PostgREST version is shown in the help text when the `.git` directory is not available - @monacoremo
+ - #1094, Fix expired JWTs starting an empty transaction on the db - @steve-chavez
+ - #1475, Fix location header for POST request with select= without PK (#1162) - @wolfgangwalther
+
+### Changed
+
+ - #1522, #1528, #1535, Docker images are now built from scratch based on a the static PostgREST executable (#1494) and with Nix instead of a `Dockerfile`. This reduces the compressed image size from over 30mb to about 4mb - @monacoremo
+ - #1475, Location header for POST request is only included when PK is available on the table (#1461) - @wolfgangwalther
+ - #1560, Volatile RPC called with GET now returns 405 Method not Allowed instead of 500 - @wolfgangwalther
+
+## [7.0.1] - 2020-05-18
+
+### Fixed
+
+- #1473, Fix overloaded computed columns on RPC - @wolfgangwalther
+- #1471, Fix POST, PATCH, DELETE with ?select= and return=minimal and PATCH with empty body - @wolfgangwalther
+- #1500, Fix missing `openapi-server-proxy-uri` config option - @steve-chavez
+- #1508, Fix `Content-Profile` not working for POST RPC - @steve-chavez
+- #1452, Fix PUT restriction for all columns - @steve-chavez
+
+### Changed
+
+- From this version onwards, the release page will only include a single Linux static executable that can be run on any Linux distribution.
+
+## [7.0.0] - 2020-04-03
+
+### Added
+
 - #1417, `Accept: application/vnd.pgrst.object+json` behavior is now enforced for POST/PATCH/DELETE regardless of `Prefer: return=representation/minimal` - @dwagin
 - #1415, Add support for user defined socket permission via `server-unix-socket-mode` config option - @Dansvidania
 - #1383, Add support for HEAD request - @steve-chavez
-- #1378, Add support for `Prefer: count=planned` and `Prefer: count=estimated` on GET /table - @steve-chavez
+- #1378, Add support for `Prefer: count=planned` and `Prefer: count=estimated` on GET /table - @steve-chavez, @LorenzHenk
 - #1327, Add support for optional query parameter `on_conflict` to upsert with specified keys for POST - @ykst
 - #1430, Allow specifying the foreign key constraint name(`/source?select=fk_constraint(*)`) to disambiguate an embedding - @steve-chavez
 - #1168, Allow access to the `Authorization` header through the `request.header.authorization` GUC - @steve-chavez
 - #1435, Add `request.method` and `request.path` GUCs - @steve-chavez
 - #1088, Allow adding headers to GET/POST/PATCH/PUT/DELETE responses through the `response.headers` GUC - @steve-chavez
 - #1427, Allow overriding provided headers(Location, Content-Type, etc) through the `response.headers` GUC - @steve-chavez
+- #1450, Allow multiple schemas to be exposed in one instance. The schema to use can be selected through the headers `Accept-Profile` for GET/HEAD and `Content-Profile` for POST/PATCH/PUT/DELETE - @steve-chavez, @mahmoudkassem
 
 ### Fixed
 

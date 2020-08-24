@@ -1,4 +1,15 @@
 #! /usr/bin/env bash
+
+# This test script expects that a `postgrest` executable with profiling enabled
+# is on the PATH. With stack, for example, you can run `stack install --profile
+# postgrest`.
+
+set -eu
+
+export POSTGREST_TEST_CONNECTION=${POSTGREST_TEST_CONNECTION:-"postgres:///postgrest_test"}
+
+trap "kill 0" int term exit
+
 currentTest=1
 failedTests=0
 result(){ echo "$1 $currentTest $2"; currentTest=$(( $currentTest + 1 )); }
@@ -7,13 +18,8 @@ ko(){ result 'not ok' "- $1"; failedTests=$(( $failedTests + 1 )); }
 
 pgrPort=49421
 
-pgrStopAll(){ pkill -f "$(stack path --profile --local-install-root)/bin/postgrest"; }
-
-pgrStart(){ stack exec --profile -- postgrest test/memory-tests/config +RTS -p -h >/dev/null & pgrPID="$!"; }
+pgrStart(){ postgrest test/memory-tests/config +RTS -p -h > /dev/null & pgrPID="$!"; }
 pgrStop(){ kill "$pgrPID" 2>/dev/null; }
-
-setUp(){ pgrStopAll; }
-cleanUp(){ pgrStopAll; }
 
 checkPgrStarted(){
   while pgrStarted && test $(rootStatus) -ne 200
@@ -90,26 +96,24 @@ postJsonArrayTest(){
   fi
 }
 
-setUp
-
 echo "Running memory usage tests.."
 
-jsonKeyTest "1M" "POST" "/rpc/leak?columns=blob" "12M"
-jsonKeyTest "1M" "POST" "/leak?columns=blob" "12M"
-jsonKeyTest "1M" "PATCH" "/leak?id=eq.1&columns=blob" "12M"
+jsonKeyTest "1M" "POST" "/rpc/leak?columns=blob" "13M"
+jsonKeyTest "1M" "POST" "/leak?columns=blob" "13M"
+jsonKeyTest "1M" "PATCH" "/leak?id=eq.1&columns=blob" "13M"
 
-jsonKeyTest "10M" "POST" "/rpc/leak?columns=blob" "40M"
-jsonKeyTest "10M" "POST" "/leak?columns=blob" "40M"
-jsonKeyTest "10M" "PATCH" "/leak?id=eq.1&columns=blob" "40M"
+jsonKeyTest "10M" "POST" "/rpc/leak?columns=blob" "41M"
+jsonKeyTest "10M" "POST" "/leak?columns=blob" "41M"
+jsonKeyTest "10M" "PATCH" "/leak?id=eq.1&columns=blob" "41M"
 
-jsonKeyTest "50M" "POST" "/rpc/leak?columns=blob" "170M"
-jsonKeyTest "50M" "POST" "/leak?columns=blob" "170M"
-jsonKeyTest "50M" "PATCH" "/leak?id=eq.1&columns=blob" "170M"
+jsonKeyTest "50M" "POST" "/rpc/leak?columns=blob" "171M"
+jsonKeyTest "50M" "POST" "/leak?columns=blob" "171M"
+jsonKeyTest "50M" "PATCH" "/leak?id=eq.1&columns=blob" "171M"
 
-postJsonArrayTest "1000" "/perf_articles?columns=id,body" "10M"
-postJsonArrayTest "10000" "/perf_articles?columns=id,body" "10M"
-postJsonArrayTest "100000" "/perf_articles?columns=id,body" "20M"
+postJsonArrayTest "1000" "/perf_articles?columns=id,body" "11M"
+postJsonArrayTest "10000" "/perf_articles?columns=id,body" "11M"
+postJsonArrayTest "100000" "/perf_articles?columns=id,body" "21M"
 
-cleanUp
+trap - int term exit
 
 exit $failedTests
